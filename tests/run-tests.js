@@ -16,6 +16,7 @@ const JSZip = require(path.join(ROOT, 'vendor/jszip.min.js'));
 const docx = new Function(fs.readFileSync(path.join(ROOT, 'vendor/docx.iife.js'), 'utf8') + '\nreturn docx;')();
 const B = require(path.join(ROOT, 'js/analysis.js'));
 const T = require(path.join(ROOT, 'js/template.js'));
+const M = require(path.join(ROOT, 'js/mail.js'));
 const O = require(path.join(ROOT, 'js/outputs.js')).create({ docx, XLSX, JSZip });
 
 let passed = 0, failed = 0;
@@ -83,7 +84,8 @@ test('NCRP headers auto-map to every field', () => {
   assert.deepStrictEqual(txnMap, {
     ack: 'Acknowledgement No.', account: 'Account No./ (Wallet /PG/PA) Id', bank: 'Bank/FIs', ifsc: 'Ifsc Code',
     layer: 'Layer', txnId: 'Transaction Id / UTR Number', txnDate: 'Transaction Date',
-    amount: 'Transaction Amount', disputed: 'Disputed Amount',
+    amount: 'Transaction Amount', disputed: 'Disputed Amount', holdAmount: 'Put on Hold Amount',
+    phone: 'Suspect Mobile No.', url: 'Suspect URL', socialId: 'Suspect Social Media / UPI ID',
   });
 });
 test('remembered mapping wins over guesses when the header exists', () => {
@@ -97,6 +99,8 @@ test('nodal sheet headers auto-map', () => {
   assert.strictEqual(nodalMap.ifscPrefix, 'IFSC Prefix');
   assert.strictEqual(nodalMap.email, 'Email ID');
   assert.strictEqual(nodalMap.email2, 'Alternate Email');
+  assert.strictEqual(nodalMap.category, 'Category');
+  assert.strictEqual(nodalMap.domains, 'Domains / UPI Handles');
 });
 
 // --------------------------------------------------------------- analysis
@@ -107,7 +111,7 @@ test('reads all rows, 8 Ack nos, 3 layers', () => {
   assert.deepStrictEqual(Object.keys(result.stats.layers).sort(), ['1', '2', '3']);
 });
 test('only Layer 1 rows are analysed', () => {
-  assert.strictEqual(result.stats.layerRows, 17);
+  assert.strictEqual(result.stats.layerRows, 16, 'unique Layer 1 rows (one exact duplicate)');
   assert.strictEqual(result.accounts.length, 10);
   // Layer 2/3-only accounts must not appear
   ['221100998877', '443322110099', '909090909090', '353535353535'].forEach((a) => assert.ok(!byAcc[a], a));
@@ -190,6 +194,111 @@ test('manual override resolves an unmatched bank', () => {
   assert.strictEqual(g.groups.find((x) => x.bankName === 'Demo Bank Limited').accounts.length, 2);
 });
 
+// ------------------------------------------------- loss, hold, identifiers
+section('Total loss, put on hold & identifiers');
+test('per-Ack total loss (Layer 1 disputed) and put-on-hold amounts', () => {
+  const ack = (n) => result.ackSummary.find((a) => a.ack === '999000000001' + n);
+  assert.strictEqual(result.ackSummary.length, 8);
+  assert.strictEqual(B.paiseToNumber(ack('01').lossPaise), 32000); // 25,000 + 7,000 at Layer 1
+  assert.strictEqual(B.paiseToNumber(ack('01').holdPaise), 7000);
+  assert.strictEqual(B.paiseToNumber(ack('04').holdPaise), 25000, 'hold counted at any layer');
+  assert.deepStrictEqual(ack('01').layers, [1, 2, 3]);
+  assert.strictEqual(B.paiseToNumber(result.stats.totalLossPaise), 303699.5);
+  assert.strictEqual(B.paiseToNumber(result.stats.totalHoldPaise), 61000);
+});
+test('identifier classification', () => {
+  const c = (v, h) => B.classifyIdentifier(v, h);
+  assert.deepStrictEqual([c('+91 98765-43210', 'phone').type, c('+91 98765-43210', 'phone').value], ['phone', '9876543210']);
+  assert.strictEqual(c('09876543210').value, '9876543210');
+  assert.ok(c('12345', 'phone').warning);
+  assert.strictEqual(c('www.Fraud-Site.example/x').domain, 'fraud-site.example');
+  assert.strictEqual(c('https://samplegram.example/u', 'social').type, 'social');
+  assert.strictEqual(c('@Some_Handle', 'social').value, 'some_handle');
+  assert.strictEqual(c('payme@okfict').type, 'upi');
+  assert.strictEqual(c('Cheat@Mail.example').type, 'email');
+  assert.strictEqual(c('NA', 'phone'), null);
+});
+const idents = B.extractIdentifiers(txnTable.rows, txnMap);
+const identOf = (v) => idents.find((i) => i.value === v);
+test('identifiers extracted from the export, merged across Ack nos', () => {
+  assert.strictEqual(idents.length, 9);
+  assert.deepStrictEqual(identOf('9000000001').acks, ['99900000000101', '99900000000105']);
+  assert.ok(identOf('9000000002'), '+91 prefix normalised');
+  assert.ok(identOf('9000000003') && identOf('9000000004'), 'comma-separated cell split');
+  assert.strictEqual(idents.filter((i) => i.type === 'phone').length, 4);
+});
+test('directory categories and domain / UPI-handle matching', () => {
+  const byName = (n) => directory.find((d) => d.bank === n);
+  assert.strictEqual(byName('Example Telecom Ltd').category, 'telecom');
+  assert.strictEqual(byName('DemoChat Messenger').category, 'platform');
+  assert.strictEqual(byName('Fictional Payments Bank').category, 'payment');
+  assert.strictEqual(B.matchIdentifier(identOf('https://samplegram.example/fake.investment.tips'), directory).entry.bank, 'SampleGram (Sample Social Inc.)');
+  assert.strictEqual(B.matchIdentifier(identOf('scammer99@okfict'), directory).entry.bank, 'Fictional Payments Bank');
+  assert.strictEqual(B.matchIdentifier(identOf('9000000001'), directory).entry, null, 'phones need an operator');
+  assert.strictEqual(B.matchIdentifier(identOf('9000000001'), directory, { 'phone:9000000001': 'Example Telecom Ltd' }).method, 'manual');
+  assert.strictEqual(B.matchBank('SampleGram', '', directory).entry, null, 'platforms never match bank accounts');
+});
+test('identifier grouping by recipient, unassigned flagged', () => {
+  const g = B.groupIdentifiers(idents, directory, { 'phone:9000000001': 'Example Telecom Ltd', 'phone:9000000002': 'Example Telecom Ltd' });
+  const tel = g.find((x) => x.bankName === 'Example Telecom Ltd');
+  assert.strictEqual(tel.items.length, 2);
+  assert.strictEqual(tel.kind, 'telecom');
+  const unassigned = g.filter((x) => !x.entry);
+  assert.deepStrictEqual(unassigned.map((x) => x.key).sort(), ['U:phone', 'U:social', 'U:url']);
+});
+test('mandatory-field prompts for a case', () => {
+  const none = B.checkCase({}, {}, null, []).map((x) => x.field);
+  ['firNo', 'firDate', 'policeStation', 'sections', 'firCopy', 'export', 'officer', 'officerEmail'].forEach((f) => assert.ok(none.includes(f), f));
+  const full = B.checkCase({ firNo: '1/2026', firDate: '01-01-2026', policeStation: 'PS', sections: '318 BNS', hasFirCopy: true, hasExport: true },
+    { officerName: 'A', designation: 'B', officerEmail: 'a@b.example' }, result, grouped.groups);
+  assert.deepStrictEqual(full.filter((x) => x.level === 'missing').map((x) => x.field), ['recipient:U:NOWHERE RURAL BANK']);
+  assert.ok(full.some((x) => x.field === 'rows.ifsc' && x.level === 'warning'));
+});
+
+// ------------------------------------------------------------------ e-mail
+section('E-mail drafts & replies');
+test('.eml draft round-trips with attachments intact', () => {
+  const bin = new Uint8Array(5000).map((_, i) => (i * 31) % 256);
+  const eml = M.buildEml({ fromName: 'SI Tést', fromEmail: 'cyber@police.example', to: ['a@x.example'], subject: 'Notice – Bank [Ref: N94-123.2026-01]',
+    text: 'Sir/Madam,\nबैंक ₹', attachments: [{ name: 'n.docx', type: 'application/octet-stream', data: bin }, { name: 'FIR.pdf', type: 'application/pdf', data: new Uint8Array([1, 2, 3]) }] });
+  assert.ok(/^X-Unsent: 1$/m.test(eml), 'opens as a draft in Outlook');
+  const p = M.parseEml(eml);
+  assert.strictEqual(p.subject, 'Notice – Bank [Ref: N94-123.2026-01]');
+  assert.strictEqual(p.text.replace(/\r/g, ''), 'Sir/Madam,\nबैंक ₹');
+  assert.deepStrictEqual(p.attachments.map((a) => a.name), ['n.docx', 'FIR.pdf']);
+  assert.ok(Buffer.from(p.attachments[0].data).equals(Buffer.from(bin)));
+});
+test('reply .eml from another mail client: quoted-printable, RFC 2231 file name, nested multipart', () => {
+  const reply = [
+    'From: "Nodal Officer" <le.cell@samplefederal.example>', 'To: cyber@police.example',
+    'Subject: =?UTF-8?Q?RE:_Notice_u/s_94_BNSS_=E2=80=93_Sample_Federal_Bank_[Ref:_N94-123.2026-03]?=',
+    'Date: Thu, 05 Nov 2026 10:00:00 +0530', 'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="OUTER"', '',
+    '--OUTER', 'Content-Type: multipart/alternative; boundary="INNER"', '',
+    '--INNER', 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: quoted-printable', '',
+    'Please find the statement attached =E2=80=93 regards.=', '', '--INNER', 'Content-Type: text/html; charset=utf-8', '', '<p>Please find</p>', '--INNER--', '',
+    '--OUTER', 'Content-Type: application/pdf', 'Content-Transfer-Encoding: base64', "Content-Disposition: attachment; filename*=UTF-8''Statement%20%E2%82%B9.pdf", '',
+    Buffer.from('%PDF-fake').toString('base64'), '--OUTER--', 'epilogue text', ''
+  ].join('\r\n');
+  const p = M.parseEml(Buffer.from(reply, 'latin1'));
+  assert.strictEqual(p.subject, 'RE: Notice u/s 94 BNSS – Sample Federal Bank [Ref: N94-123.2026-03]');
+  assert.strictEqual(p.fromEmail, 'le.cell@samplefederal.example');
+  assert.strictEqual(p.text, 'Please find the statement attached – regards.');
+  assert.strictEqual(p.attachments.length, 1);
+  assert.strictEqual(p.attachments[0].name, 'Statement ₹.pdf');
+  assert.strictEqual(Buffer.from(p.attachments[0].data).toString(), '%PDF-fake');
+  const notices = [{ ref: 'N94-123.2026-01', emails: ['nodal@examplenational.example'] }, { ref: 'N94-123.2026-03', emails: ['le.cell@samplefederal.example'] }];
+  assert.strictEqual(M.matchReply(p, notices).notice.ref, 'N94-123.2026-03');
+  assert.strictEqual(M.matchReply(p, notices).method, 'ref');
+});
+test('reply matching falls back to the sender address, and flags ambiguity', () => {
+  const n = [{ ref: 'A', emails: ['x@bank.example'], status: 'sent' }, { ref: 'B', emails: ['y@other.example'], status: 'sent' }, { ref: 'C', emails: ['y@other.example'], status: 'sent' }];
+  assert.strictEqual(M.matchReply({ subject: 'Re: your letter', fromEmail: 'x@bank.example' }, n).notice.ref, 'A');
+  assert.strictEqual(M.matchReply({ subject: 'Re: info', fromEmail: 'other.officer@bank.example' }, n).method, 'sender', 'same domain');
+  assert.strictEqual(M.matchReply({ subject: 'Re', fromEmail: 'y@other.example' }, n).method, 'ambiguous');
+  assert.strictEqual(M.matchReply({ subject: 'hi', fromEmail: 'z@none.example' }, n).method, 'none');
+  assert.strictEqual(M.noticeRef('Cr.No 45/2026', 3), 'N94-CR.NO.45.2026-03');
+});
+
 // ---------------------------------------------------------------- template
 section('Template & outputs');
 test('placeholders fill and the table block is produced', () => {
@@ -210,56 +319,108 @@ test('file names are safe and unique', () => {
   assert.strictEqual(gs[1].fileName, 'Sec94_BNSS_Cr.No_12_2026_A_B_Bank_2.docx');
 });
 
-const settings = { officerName: 'SI Synthetic Officer', designation: 'Sub-Inspector', station: 'Cyber Crime Police Station, Testpur',
-  caseRef: 'CCPS/TST/2026/001', phone: '0000000000', officerEmail: 'cyber@police.example', noticeDate: '04-11-2026' };
+test('requested documents depend on recipient category', () => {
+  assert.deepStrictEqual(T.defaultRequested('bank'), ['statement', 'kyc', 'aof', 'photos', 'aadhaar', 'pan']);
+  assert.deepStrictEqual(T.defaultRequested('telecom'), ['kyc', 'photos', 'aadhaar', 'cdr', 'sdr', 'ipdr']);
+  const tel = { kind: 'telecom', bankName: 'Example Telecom Ltd', acks: ['1'], items: [identOf('9000000001')], accounts: [] };
+  const blocks = T.toBlocks(T.DEFAULT_TEMPLATE, T.valuesFor(tel, {}, { firNo: '123/2026', periodFrom: '01-02-2026', periodTo: '31-03-2026' }), tel);
+  const text = blocks.filter((b) => b.type === 'para').map((b) => b.runs.map((r) => r.text).join('')).join('\n');
+  assert.ok(text.includes('Call Detail Records (CDR) with cell-ID / tower location for the period 01-02-2026 to 31-03-2026.'));
+  assert.ok(text.includes('1 mobile number serviced by your network'));
+  assert.ok(text.includes('Request for production of KYC details, Photographs, Aadhaar, CDR, SDR / CAF, IPDR under'));
+  const table = blocks.find((b) => b.type === 'table');
+  assert.deepStrictEqual(table.headers, T.ID_TABLE_HEADERS);
+  const noPeriod = T.toBlocks('{{requested_items}}', T.valuesFor(tel, {}, {}), tel).map((b) => b.runs[0].text);
+  assert.ok(noPeriod.includes('5. Call Detail Records (CDR) with cell-ID / tower location.') || noPeriod.some((t) => /CDR\) with cell-ID \/ tower location\.$/.test(t)));
+});
 
-test('ZIP contains one .docx per bank, the Excel summary and the e-mail list', async () => {
+const settings = { officerName: 'SI Synthetic Officer', designation: 'Sub-Inspector', station: 'Cyber Crime Police Station, Testpur',
+  caseRef: '123/2026', phone: '0000000000', officerEmail: 'cyber@police.example', noticeDate: '04-11-2026', replyDays: 7 };
+const caseInfo = { firNo: '123/2026', firDate: '01-03-2026', policeStation: 'Cyber Crime PS, Testpur', sections: '318(4) BNS; 66D IT Act',
+  periodFrom: '01-02-2026', periodTo: '31-03-2026', totalLossPaise: result.stats.totalLossPaise, holdPaise: result.stats.totalHoldPaise };
+
+/** Same merge the UI does: bank groups + identifier groups, one notice per nodal entry. */
+function recipients(assignments) {
+  const idG = B.groupIdentifiers(idents, directory, assignments);
+  const byKey = {}, list = [];
+  grouped.groups.concat(idG).forEach((g) => {
+    const k = g.entry ? g.entry.id : 'X' + g.key;
+    if (!byKey[k]) { byKey[k] = Object.assign({}, g, { accounts: (g.accounts || []).slice(), items: (g.items || []).slice(), acks: g.acks.slice() }); list.push(byKey[k]); }
+    else { byKey[k].items = byKey[k].items.concat(g.items || []); g.acks.forEach((a) => byKey[k].acks.includes(a) || byKey[k].acks.push(a)); }
+  });
+  return list.filter((g) => g.entry || g.accounts.length);
+}
+
+test('ZIP: one .docx per recipient, e-mail drafts with FIR copy, Excel summary, e-mail list', async () => {
+  const groups = recipients({ 'phone:9000000001': 'Example Telecom Ltd', 'phone:9000000002': 'Example Telecom Ltd', 'phone:9000000003': 'Demo Mobile Networks', 'phone:9000000004': 'Demo Mobile Networks' });
+  O.assignFileNames(groups, settings);
+  groups.forEach((g, i) => { g.noticeRef = M.noticeRef(caseInfo.firNo, i + 1); });
   const accounts = result.accounts.map((a) => Object.assign({}, a, { selected: true, match: B.matchBank(a.bank, a.ifsc, directory) }));
-  O.assignFileNames(grouped.groups, settings);
-  const ctx = { analysis: result, accounts, groups: grouped.groups, unmatched: grouped.unmatched, settings };
-  const zipBuf = await O.bundleZip(ctx, T.DEFAULT_TEMPLATE);
+  idents.forEach((i) => { i.selected = true; i.match = B.matchIdentifier(i, directory, {}); });
+  const fir = fs.readFileSync(path.join(ROOT, 'samples/sample_fir_copy.pdf'));
+  const ctx = { analysis: result, accounts, groups, unmatched: groups.filter((g) => !g.emails.length), settings, caseInfo, identifiers: idents,
+    firCopy: { name: 'FIR_Copy_123_2026.pdf', type: 'application/pdf', data: new Uint8Array(fir) } };
+  const zipBuf = await O.bundleZip(ctx, { notice: T.DEFAULT_TEMPLATE, subject: T.DEFAULT_EMAIL_SUBJECT, body: T.DEFAULT_EMAIL_BODY });
   const outDir = path.join(ROOT, 'output', 'test-run');
+  fs.rmSync(outDir, { recursive: true, force: true });
   fs.mkdirSync(outDir, { recursive: true });
   fs.writeFileSync(path.join(outDir, 'bundle.zip'), zipBuf);
 
   const zip = await JSZip.loadAsync(zipBuf);
   const names = Object.keys(zip.files).filter((n) => !zip.files[n].dir).sort();
   const docs = names.filter((n) => n.endsWith('.docx'));
-  assert.strictEqual(docs.length, 7);
-  assert.ok(names.includes('BNSS94_Summary.xlsx'));
-  assert.ok(names.includes('Email_List.csv'));
+  const emls = names.filter((n) => n.endsWith('.eml'));
+  assert.strictEqual(docs.length, 11, '7 banks/payment (UPI ID merged into the payment bank) + 2 telecom + 2 platforms');
+  assert.strictEqual(emls.length, 10, 'no draft for the bank without an e-mail ID');
+  ['BNSS94_Summary.xlsx', 'Email_List.csv', 'FIR_Copy_123_2026.pdf'].forEach((f) => assert.ok(names.includes(f), f));
 
-  // Each .docx is a valid zip with the account numbers in document.xml
   for (const d of docs) {
     const buf = await zip.file(d).async('nodebuffer');
     fs.writeFileSync(path.join(outDir, path.basename(d)), buf);
-    const inner = await JSZip.loadAsync(buf);
-    const xml = await inner.file('word/document.xml').async('string');
-    assert.ok(xml.includes('Section 94') || xml.includes('SECTION 94'), d);
+    const xml = await (await JSZip.loadAsync(buf)).file('word/document.xml').async('string');
+    assert.ok(xml.includes('SECTION 94'), d);
     assert.ok(!xml.includes('{{'), d + ' has unfilled placeholders');
+    assert.ok(xml.includes('FIR No. 123/2026 dated 01-03-2026'), d + ' FIR reference');
   }
-  const exnb = await JSZip.loadAsync(await zip.file('Notices/Sec94_BNSS_CCPS_TST_2026_001_Example_National_Bank.docx').async('nodebuffer'));
-  const exml = await exnb.file('word/document.xml').async('string');
-  assert.ok(exml.includes('000112233445566') && exml.includes('000098765432'));
-  assert.ok(exml.includes('<w:tbl>'), 'accounts table present');
+  const docXml = async (f) => (await JSZip.loadAsync(await zip.file('Notices/' + f).async('nodebuffer'))).file('word/document.xml').async('string');
+  const exml = await docXml('Sec94_BNSS_123_2026_Example_National_Bank.docx');
+  assert.ok(exml.includes('000112233445566') && exml.includes('000098765432') && exml.includes('Account Opening Form'));
+  const txml = await docXml('Sec94_BNSS_123_2026_Example_Telecom_Ltd.docx');
+  assert.ok(txml.includes('9000000001') && txml.includes('Call Detail Records') && txml.includes('IPDR') && !txml.includes('Account Opening Form'));
+  const pxml = await docXml('Sec94_BNSS_123_2026_Fictional_Payments_Bank.docx');
+  assert.ok(pxml.includes('556677889900') && pxml.includes('scammer99@okfict'), 'account and UPI ID in one notice');
+  assert.strictEqual((pxml.match(/<w:tbl>/g) || []).length, 2, 'two tables: accounts and identifiers');
 
-  // Excel summary: identifiers are text cells with leading zeros intact
+  // E-mail draft: addressed to the nodal officer, notice + FIR copy attached, ref in subject
+  const emlText = await zip.file('Email_Drafts/Sec94_BNSS_123_2026_Sample_Federal_Bank.eml').async('string');
+  fs.writeFileSync(path.join(outDir, 'Sample_Federal_Bank.eml'), emlText);
+  const mail = M.parseEml(emlText);
+  assert.deepStrictEqual(mail.to, ['le.cell@samplefederal.example', 'fraud@samplefederal.example']);
+  const sfRef = groups.find((g) => g.bankName === 'Sample Federal Bank').noticeRef;
+  assert.ok(mail.subject.includes('[Ref: ' + sfRef + ']'));
+  assert.deepStrictEqual(mail.attachments.map((a) => a.name), ['Sec94_BNSS_123_2026_Sample_Federal_Bank.docx', 'FIR_Copy_123_2026.pdf']);
+  assert.ok(Buffer.from(mail.attachments[1].data).equals(fir));
+
+  // Excel summary
   const xbuf = await zip.file('BNSS94_Summary.xlsx').async('nodebuffer');
   fs.writeFileSync(path.join(outDir, 'BNSS94_Summary.xlsx'), xbuf);
   const wb = XLSX.read(xbuf);
-  assert.deepStrictEqual(wb.SheetNames, ['Summary', 'Layer1 Analysis', 'Bank-wise Accounts', 'Email Mapping', 'Layer1 Transactions', 'Unmatched Banks']);
+  assert.deepStrictEqual(wb.SheetNames, ['Summary', 'Ack Summary', 'Layer1 Analysis', 'Bank-wise Accounts', 'Identifiers', 'Email Mapping', 'Layer1 Transactions', 'Unmatched']);
   const l1 = wb.Sheets['Layer1 Analysis'];
   assert.strictEqual(l1.C2.t, 's');
   assert.strictEqual(l1.C2.v, '000112233445566');
   assert.strictEqual(l1.J2.v, 83000);
   const em = XLSX.utils.sheet_to_json(wb.Sheets['Email Mapping']);
-  assert.strictEqual(em.length, 7);
-  const sfb = em.find((r) => r.Bank === 'Sample Federal Bank');
+  assert.strictEqual(em.length, 11);
+  const sfb = em.find((r) => r.Recipient === 'Sample Federal Bank');
   assert.strictEqual(sfb['Nodal E-mail(s)'], 'le.cell@samplefederal.example; fraud@samplefederal.example');
-  assert.strictEqual(sfb.Attachment, 'Sec94_BNSS_CCPS_TST_2026_001_Sample_Federal_Bank.docx');
+  assert.strictEqual(sfb.Attachment, 'Sec94_BNSS_123_2026_Sample_Federal_Bank.docx');
+  assert.strictEqual(em.find((r) => r.Recipient === 'Example Telecom Ltd').Category, 'Telecom (TSP)');
+  const ackSheet = XLSX.utils.sheet_to_json(wb.Sheets['Ack Summary']);
+  assert.strictEqual(ackSheet.find((r) => r['Ack No'] === '99900000000104')['Put on Hold (₹)'], 25000);
 
   const csv = await zip.file('Email_List.csv').async('string');
-  assert.ok(csv.includes('Nowhere Rural Bank,NOT FOUND'));
+  assert.ok(/Nowhere Rural Bank,N94-123\.2026-\d+,NOT FOUND/.test(csv));
 });
 
 (async () => {

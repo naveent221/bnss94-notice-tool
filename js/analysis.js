@@ -33,7 +33,15 @@
     { key: 'amount', label: 'Amount',
       synonyms: ['transaction amount', 'txn amount', 'amount', 'amount rs'] },
     { key: 'disputed', label: 'Disputed Amount',
-      synonyms: ['disputed amount', 'dispute amount', 'disputed amt', 'fraud amount', 'amount disputed'] }
+      synonyms: ['disputed amount', 'dispute amount', 'disputed amt', 'fraud amount', 'amount disputed'] },
+    { key: 'holdAmount', label: 'Put on Hold Amount',
+      synonyms: ['put on hold amount', 'amount put on hold', 'hold amount', 'put on hold', 'lien amount', 'amount on hold'] },
+    { key: 'phone', label: 'Suspect Mobile No(s)',
+      synonyms: ['suspect mobile no', 'suspect mobile number', 'suspect mobile', 'suspect phone', 'mobile no', 'mobile number', 'phone number', 'phone no'] },
+    { key: 'url', label: 'Suspect URL(s)',
+      synonyms: ['suspect url', 'suspect website', 'url', 'website', 'web url', 'link'] },
+    { key: 'socialId', label: 'Suspect Social Media / UPI / E-mail ID(s)',
+      synonyms: ['suspect social media id', 'social media id', 'suspect id', 'social media handle', 'social media', 'upi id', 'suspect email'] }
   ];
 
   /** Fields of the nodal-officer sheet. */
@@ -49,8 +57,31 @@
     { key: 'contact', label: 'Nodal Officer Name',
       synonyms: ['nodal officer name', 'nodal officer', 'officer name', 'contact person', 'name'] },
     { key: 'address', label: 'Address',
-      synonyms: ['address', 'postal address', 'office address'] }
+      synonyms: ['address', 'postal address', 'office address'] },
+    { key: 'category', label: 'Category (Bank / Telecom / Platform / Payment)',
+      synonyms: ['category', 'entity type', 'type of entity', 'sector', 'type'] },
+    { key: 'domains', label: 'Domains / UPI handles',
+      synonyms: ['domains', 'domain', 'website domains', 'websites', 'upi handles', 'domains upi handles'] }
   ];
+
+  /** Recipient categories. Banks and payment entities receive account-based notices. */
+  var CATEGORIES = {
+    bank: 'Bank',
+    payment: 'Payment / Wallet',
+    telecom: 'Telecom (TSP)',
+    platform: 'Platform / Intermediary'
+  };
+
+  function normCategory(text) {
+    var s = String(text == null ? '' : text).toLowerCase();
+    if (!s.trim()) return 'bank';
+    if (/tele|tsp|mobile|operator|cellular|isp/.test(s)) return 'telecom';
+    if (/wallet|payment|\bpa\b|\bpg\b|upi|fintech/.test(s)) return 'payment';
+    if (/social|platform|intermediar|messag|\bapp\b|website|internet|e-?mail|host|registrar|domain/.test(s)) return 'platform';
+    return 'bank';
+  }
+
+  function isAccountCategory(c) { return c === 'bank' || c === 'payment'; }
 
   // ---------------------------------------------------------------------------
   // String helpers
@@ -196,6 +227,8 @@
 
   function formatDate(raw) {
     if (raw == null || raw === '') return '';
+    // ISO timestamps appear when case data comes back from a JSON backup.
+    if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(raw)) raw = new Date(raw);
     if (raw instanceof Date && !isNaN(raw)) {
       return pad2(raw.getDate()) + '-' + pad2(raw.getMonth() + 1) + '-' + raw.getFullYear();
     }
@@ -268,8 +301,15 @@
       var key = normBankName(bank);
       var entry = byName[key];
       if (!entry) {
-        entry = byName[key] = { id: 'N' + (list.length + 1), bank: bank, ifscPrefixes: [], emails: [], contact: '', address: '' };
+        entry = byName[key] = { id: 'N' + (list.length + 1), bank: bank, ifscPrefixes: [], emails: [], contact: '', address: '',
+          category: normCategory(mapping.category ? r[mapping.category] : ''), domains: [] };
         list.push(entry);
+      }
+      if (mapping.domains) {
+        String(r[mapping.domains] == null ? '' : r[mapping.domains]).split(/[,;\s]+/).forEach(function (d) {
+          d = d.toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/^@/, '').replace(/\/.*$/, '');
+          if (d && entry.domains.indexOf(d) < 0) entry.domains.push(d);
+        });
       }
       if (mapping.ifscPrefix) {
         String(r[mapping.ifscPrefix] == null ? '' : r[mapping.ifscPrefix]).split(/[,;\/\s]+/).forEach(function (p) {
@@ -294,6 +334,8 @@
    */
   function matchBank(bankName, ifsc, directory, overrides) {
     var key = normBankName(bankName);
+    // Telecom operators and platforms never receive account notices.
+    directory = (directory || []).filter(function (d) { return !d.category || isAccountCategory(d.category); });
     if (overrides && overrides[key]) {
       var o = directory.filter(function (d) { return d.id === overrides[key] || d.bank === overrides[key]; })[0];
       if (o) return { entry: o, method: 'manual', score: 1 };
@@ -391,28 +433,43 @@
     var hasLayer = !!mapping.layer;
     if (!hasLayer) warnings.push('No "Layer" column mapped — every row is treated as Layer ' + targetLayer + '.');
 
-    var accounts = {}, seenTxn = {};
+    var accounts = {}, seenTxn = {}, ackInfo = {};
+    var missing = { bank: 0, txnId: 0, amount: 0, ifsc: 0 };
     rows.forEach(function (r) {
       var get = function (k) { return mapping[k] ? r[mapping[k]] : ''; };
       var ack = normId(get('ack')).value;
       var accN = normId(get('account'));
       var acc = accN.value;
       var layer = hasLayer ? parseLayer(get('layer')) : targetLayer;
+      var txnId = normId(get('txnId')).value;
+      var amount = parseAmountPaise(get('amount'));
+      var disputed = mapping.disputed ? parseAmountPaise(get('disputed')) : amount;
+      var hold = mapping.holdAmount ? parseAmountPaise(get('holdAmount')) : 0;
       if (ack) stats.acks[ack] = true;
       if (!isNaN(layer)) stats.layers[layer] = (stats.layers[layer] || 0) + 1;
+
+      // Exact duplicate rows (same ack, layer, account, UTR and amounts) are counted once.
+      var sig = [ack, layer, acc, txnId, amount, disputed, hold, formatDate(get('txnDate'))].join('|');
+      if (txnId && seenTxn[sig]) { if (layer === targetLayer) stats.duplicateRows++; return; }
+      seenTxn[sig] = true;
+
+      if (ack) {
+        var ai = ackInfo[ack] || (ackInfo[ack] = { ack: ack, lossPaise: 0, holdPaise: 0, layers: {}, rowCount: 0, l1Accounts: {} });
+        ai.rowCount++;
+        ai.holdPaise += hold;
+        if (!isNaN(layer)) ai.layers[layer] = true;
+        if (layer === targetLayer) { ai.lossPaise += disputed; if (acc) ai.l1Accounts[acc] = true; }
+      }
+
       if (layer !== targetLayer) return;
       stats.layerRows++;
       if (!acc) { skipped.push({ row: r.__row, reason: 'blank account number' }); return; }
       if (!ack) { skipped.push({ row: r.__row, reason: 'blank Ack No' }); return; }
       if (accN.warning) idWarnings[acc] = accN.warning;
-
-      var txnId = normId(get('txnId')).value;
-      var amount = parseAmountPaise(get('amount'));
-      var disputed = mapping.disputed ? parseAmountPaise(get('disputed')) : amount;
-      // Exact duplicate rows (same ack, account, UTR and amounts) are counted once.
-      var sig = [ack, acc, txnId, amount, disputed, formatDate(get('txnDate'))].join('|');
-      if (txnId && seenTxn[sig]) { stats.duplicateRows++; return; }
-      seenTxn[sig] = true;
+      if (!String(get('bank') == null ? '' : get('bank')).trim()) missing.bank++;
+      if (!txnId) missing.txnId++;
+      if (!disputed && !amount) missing.amount++;
+      if (!normIfsc(get('ifsc'))) missing.ifsc++;
 
       var a = accounts[acc];
       if (!a) {
@@ -455,9 +512,21 @@
     if (stats.duplicateRows) warnings.push(stats.duplicateRows + ' exact duplicate transaction row(s) were counted once.');
     if (skipped.length) warnings.push(skipped.length + ' Layer ' + targetLayer + ' row(s) skipped (blank account or Ack No).');
 
+    var ackSummary = Object.keys(ackInfo).sort().map(function (k) {
+      var a = ackInfo[k];
+      return { ack: a.ack, lossPaise: a.lossPaise, holdPaise: a.holdPaise, rowCount: a.rowCount,
+        layers: Object.keys(a.layers).map(Number).sort(function (x, y) { return x - y; }),
+        l1AccountCount: Object.keys(a.l1Accounts).length };
+    });
+
     return {
       accounts: list,
+      ackSummary: ackSummary,
       stats: {
+        totalLossPaise: ackSummary.reduce(function (s, a) { return s + a.lossPaise; }, 0),
+        totalHoldPaise: ackSummary.reduce(function (s, a) { return s + a.holdPaise; }, 0),
+        holdMapped: !!mapping.holdAmount,
+        missing: missing,
         totalRows: stats.totalRows,
         layerRows: stats.layerRows,
         duplicateRows: stats.duplicateRows,
@@ -492,6 +561,7 @@
       if (!g) {
         g = groups[key] = {
           key: key,
+          kind: (m.entry && m.entry.category) || 'bank',
           bankName: m.entry ? m.entry.bank : (acc.bank || '(blank bank name)'),
           entry: m.entry,
           method: m.method,
@@ -527,6 +597,172 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Non-account identifiers: phone numbers, URLs, social media / UPI / e-mail IDs
+  // ---------------------------------------------------------------------------
+
+  var ID_TYPES = { phone: 'Mobile number', url: 'URL / website', social: 'Social media ID', email: 'E-mail ID', upi: 'UPI ID', other: 'Other' };
+
+  function hostOf(url) {
+    var m = String(url).toLowerCase().match(/^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@\/]*@)?([^\/?#:]+)/);
+    return m ? m[1].replace(/^www\./, '').replace(/\.$/, '') : '';
+  }
+
+  /**
+   * Classify one identifier. `hint` is the column it came from: 'phone' | 'url' | 'social' | ''.
+   * Returns { type, value, domain, key, warning } or null for blanks.
+   */
+  function classifyIdentifier(raw, hint) {
+    var s = String(raw == null ? '' : raw).replace(INVISIBLE, ' ').trim().replace(/^['`]+/, '');
+    if (!s || /^(na|n\/a|nil|none|-|0)$/i.test(s)) return null;
+    var out = { type: 'other', value: s, domain: '', warning: null };
+    var digits = s.replace(/[\s\-().]/g, '');
+    var isUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(s) || /^www\./i.test(s) || /^[a-z0-9-]+(\.[a-z0-9-]+)+\.?(\/|$)/i.test(s) && !/@/.test(s) && !/^\+?\d[\d.]*$/.test(s);
+    if (/^\+?\d+$/.test(digits) && hint !== 'url' && hint !== 'social' || hint === 'phone' && /^\+?[\d\s\-()]+$/.test(s)) {
+      var d = digits.replace(/^\+/, '');
+      if (d.length === 12 && d.indexOf('91') === 0) d = d.slice(2);
+      else if (d.length === 11 && d[0] === '0') d = d.slice(1);
+      out.type = 'phone'; out.value = d;
+      if (!/^[6-9]\d{9}$/.test(d)) out.warning = 'not a 10-digit Indian mobile number';
+    } else if (isUrl) {
+      var url = /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : 'https://' + s;
+      out.domain = hostOf(url);
+      out.type = hint === 'social' ? 'social' : 'url';
+      out.value = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)([^\/?#]+)/i, function (m, p, h) { return p.toLowerCase() + h.toLowerCase(); }).replace(/\/$/, '');
+    } else if (/^[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(s)) {
+      out.type = 'email'; out.value = s.toLowerCase(); out.domain = s.split('@')[1].toLowerCase();
+    } else if (/^[A-Za-z0-9._-]+@[A-Za-z][A-Za-z0-9]*$/.test(s)) {
+      out.type = 'upi'; out.value = s.toLowerCase(); out.domain = s.split('@')[1].toLowerCase();
+    } else if (hint === 'social' || /^@/.test(s)) {
+      out.type = 'social'; out.value = s.replace(/^@/, '').toLowerCase();
+    }
+    out.key = out.type + ':' + out.value;
+    return out;
+  }
+
+  function splitIdentifiers(cell) {
+    return String(cell == null ? '' : cell).split(/[\n,;|]+|\s{2,}|\s+\/\s+/).map(function (x) { return x.trim(); }).filter(Boolean);
+  }
+
+  /** Merge identifiers into a list keyed by type:value, accumulating Ack numbers. */
+  function addIdentifier(map, order, item, ack, source) {
+    var cur = map[item.key];
+    if (!cur) {
+      cur = map[item.key] = { key: item.key, type: item.type, value: item.value, domain: item.domain, warning: item.warning, acks: [], sources: [] };
+      order.push(item.key);
+    }
+    if (ack && cur.acks.indexOf(ack) < 0) cur.acks.push(ack);
+    if (source && cur.sources.indexOf(source) < 0) cur.sources.push(source);
+    return cur;
+  }
+
+  /** Pull suspect phone numbers / URLs / social IDs out of the mapped export columns (all layers). */
+  function extractIdentifiers(rows, mapping, extra) {
+    var map = {}, order = [];
+    var cols = [['phone', 'phone'], ['url', 'url'], ['socialId', 'social']];
+    rows.forEach(function (r) {
+      var ack = mapping.ack ? normId(r[mapping.ack]).value : '';
+      cols.forEach(function (c) {
+        if (!mapping[c[0]]) return;
+        splitIdentifiers(r[mapping[c[0]]]).forEach(function (v) {
+          var item = classifyIdentifier(v, c[1]);
+          if (item) addIdentifier(map, order, item, ack, 'export');
+        });
+      });
+    });
+    (extra || []).forEach(function (x) {
+      var item = classifyIdentifier(x.value, x.hint || '');
+      if (!item) return;
+      var cur = addIdentifier(map, order, item, '', 'manual');
+      (x.acks || []).forEach(function (a) { if (cur.acks.indexOf(a) < 0) cur.acks.push(a); });
+    });
+    return order.map(function (k) { map[k].acks.sort(); return map[k]; });
+  }
+
+  /**
+   * Find the nodal entry for an identifier.
+   * Order: manual assignment → domain / UPI-handle match. Phones need an assignment
+   * (mobile number portability makes the number series unreliable).
+   */
+  function matchIdentifier(item, directory, assignments) {
+    var a = assignments && assignments[item.key];
+    if (a) {
+      var e = directory.filter(function (d) { return d.bank === a || d.id === a; })[0];
+      if (e) return { entry: e, method: 'manual' };
+    }
+    if (item.domain) {
+      var hit = directory.filter(function (d) {
+        return d.domains.some(function (dom) { return item.domain === dom || item.domain.slice(-(dom.length + 1)) === '.' + dom; });
+      })[0];
+      if (hit) return { entry: hit, method: 'domain' };
+    }
+    return { entry: null, method: 'none' };
+  }
+
+  /** Group selected identifiers by recipient (telecom operator, platform, payment entity …). */
+  function groupIdentifiers(items, directory, assignments) {
+    var groups = {}, order = [];
+    items.forEach(function (it) {
+      var m = matchIdentifier(it, directory, assignments);
+      var key = m.entry ? m.entry.id : 'U:' + it.type;
+      var g = groups[key];
+      if (!g) {
+        g = groups[key] = {
+          key: key, kind: m.entry ? m.entry.category : 'unassigned', bankName: m.entry ? m.entry.bank : 'Unassigned ' + ID_TYPES[it.type],
+          entry: m.entry, method: m.method, methods: {}, rawNames: [], accounts: [], items: [], ackSet: {}, disputedPaise: 0,
+          emails: m.entry ? m.entry.emails.slice() : [], normName: key
+        };
+        order.push(key);
+      }
+      g.methods[m.method] = true;
+      g.items.push(it);
+      it.acks.forEach(function (k) { g.ackSet[k] = true; });
+    });
+    var list = order.map(function (k) { var g = groups[k]; g.acks = Object.keys(g.ackSet).sort(); delete g.ackSet; return g; });
+    list.sort(function (a, b) { return (!!a.entry === !!b.entry) ? b.items.length - a.items.length : (a.entry ? 1 : -1); });
+    return list;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mandatory-field checks for a case (FIR)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * @param c  { firNo, firDate, policeStation, sections, hasFirCopy, hasExport }
+   * @param settings officer settings
+   * @param analysis result of analyse() (optional)
+   * @param groups   recipient groups (optional)
+   * @returns [{ field, message, level: 'missing' | 'warning' }]
+   */
+  function checkCase(c, settings, analysis, groups) {
+    var out = [];
+    var need = function (ok, field, message) { if (!ok) out.push({ field: field, message: message, level: 'missing' }); };
+    c = c || {}; settings = settings || {};
+    need(String(c.firNo || '').trim(), 'firNo', 'FIR number');
+    need(String(c.firDate || '').trim(), 'firDate', 'FIR date');
+    need(String(c.policeStation || '').trim(), 'policeStation', 'Police station of the FIR');
+    need(String(c.sections || '').trim(), 'sections', 'Sections of law');
+    need(c.hasFirCopy, 'firCopy', 'FIR copy (PDF / image)');
+    need(c.hasExport, 'export', 'NCRP transaction export');
+    need(settings.officerName && settings.designation, 'officer', 'Officer name and designation (Officer settings)');
+    need(settings.officerEmail, 'officerEmail', 'Officer e-mail (Officer settings) — needed on the notice and e-mail drafts');
+    if (analysis) {
+      var s = analysis.stats;
+      need(s.ackCount > 0, 'acks', 'NCRP Acknowledgement numbers (none found in the export)');
+      if (s.ackCount > 0 && !s.accountCount) out.push({ field: 'layer1', message: 'No Layer 1 accounts found — check the Layer column mapping', level: 'missing' });
+      var m = s.missing || {};
+      if (m.bank) out.push({ field: 'rows.bank', message: m.bank + ' Layer 1 row(s) without a bank name', level: 'missing' });
+      if (m.amount) out.push({ field: 'rows.amount', message: m.amount + ' Layer 1 row(s) without an amount', level: 'missing' });
+      if (m.txnId) out.push({ field: 'rows.txnId', message: m.txnId + ' Layer 1 row(s) without a Transaction ID / UTR', level: 'warning' });
+      if (m.ifsc) out.push({ field: 'rows.ifsc', message: m.ifsc + ' Layer 1 row(s) without IFSC (bank matched by name only)', level: 'warning' });
+    }
+    (groups || []).forEach(function (g) {
+      if (!g.entry) out.push({ field: 'recipient:' + g.key, message: 'No nodal officer chosen for ' + g.bankName, level: 'missing' });
+      else if (!g.emails.length) out.push({ field: 'email:' + g.key, message: 'No nodal e-mail ID for ' + g.bankName, level: 'missing' });
+    });
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
   // Template rendering (text level; the Word layout is built in outputs.js)
   // ---------------------------------------------------------------------------
 
@@ -544,7 +780,21 @@
     ['account_count', 'Number of accounts'],
     ['total_disputed', 'Total disputed amount (₹)'],
     ['nodal_officer', 'Nodal officer name from sheet'],
-    ['bank_address', 'Bank address from sheet']
+    ['bank_address', 'Bank address from sheet'],
+    ['identifiers_table', 'Same as accounts_table (tables of accounts / identifiers)'],
+    ['requested_items', 'Numbered list of documents requested (put on its own line)'],
+    ['requested_list', 'Documents requested, as one line (for the subject)'],
+    ['items_description', 'What is listed, e.g. "account(s) maintained with your bank"'],
+    ['item_count', 'Number of accounts / identifiers'],
+    ['fir_no', 'FIR number'],
+    ['fir_date', 'FIR date'],
+    ['police_station', 'Police station of the FIR'],
+    ['sections', 'Sections of law'],
+    ['period', 'Period of records requested'],
+    ['notice_ref', 'Unique notice reference (used to match replies)'],
+    ['reply_by', 'Date by which the reply is due'],
+    ['total_loss', 'Total loss in the complaint(s) (₹)'],
+    ['hold_amount', 'Total amount put on hold (₹)']
   ];
 
   /** Replace {{placeholders}} in a string. Unknown placeholders are left intact. */
@@ -580,6 +830,17 @@
   return {
     TXN_FIELDS: TXN_FIELDS,
     NODAL_FIELDS: NODAL_FIELDS,
+    CATEGORIES: CATEGORIES,
+    ID_TYPES: ID_TYPES,
+    normCategory: normCategory,
+    isAccountCategory: isAccountCategory,
+    hostOf: hostOf,
+    classifyIdentifier: classifyIdentifier,
+    splitIdentifiers: splitIdentifiers,
+    extractIdentifiers: extractIdentifiers,
+    matchIdentifier: matchIdentifier,
+    groupIdentifiers: groupIdentifiers,
+    checkCase: checkCase,
     PLACEHOLDERS: PLACEHOLDERS,
     BANK_MATCH_THRESHOLD: BANK_MATCH_THRESHOLD,
     normHeader: normHeader,
