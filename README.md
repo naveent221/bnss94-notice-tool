@@ -12,14 +12,18 @@ Phase 1 of the cyber-fraud workflow:
    payment entity, telecom operator and platform involved. Each notice requests
    the documents that suit that recipient: account statement, KYC, AOF,
    photographs, Aadhaar, PAN, CDR, SDR/CAF, IPDR, IP logs and so on.
-4. Prepare the e-mails: each notice becomes a ready-to-send e-mail draft with
-   the notice and FIR copy attached and the nodal officer's address filled in.
-5. **Prompt when a nodal officer replies.** Reply e-mails are matched to their
-   notice, attachments are saved with the case, and overdue notices are
+4. **Send the notices by e-mail** from the officer's own mailbox, with the
+   notice and FIR copy attached and the nodal officer's address filled in.
+   This uses the optional [mail helper](#mail-helper-automatic-sending-and-replies);
+   without it, the app produces ready-to-send e-mail drafts instead.
+5. **Prompt when a nodal officer replies.** With the mail helper, replies are
+   picked up from the mailbox automatically. Each reply is matched to its
+   notice, its attachments are saved with the case, and overdue notices are
    flagged.
 
-Everything happens inside your browser. There is no server, no upload, no
-analytics, and no network access.
+Everything happens on your own computer. The app itself has no server and
+does no uploading or analytics. The only network connection is the optional
+mail helper talking to **your own mail server**.
 
 ## How it works
 
@@ -101,29 +105,56 @@ analytics, and no network access.
 
 ### Sending the e-mails
 
-The app never connects to the internet, so it cannot send mail itself.
-Instead each `.eml` draft has the To address, subject, body and both
-attachments (notice and FIR copy) already filled in:
+Each notice has its own **Send** button, and **Send all by e-mail** sends every
+notice that has not been sent yet.
+
+- These buttons need the
+  [mail helper](#mail-helper-automatic-sending-and-replies) to be running and
+  set up.
+- Before anything is sent, you see the list of recipients and are asked to
+  confirm.
+- Each e-mail carries the notice (`.docx`) and the FIR copy. A copy is saved
+  in your Sent folder.
+- After sending, the notice's status becomes *Sent* and its reply countdown
+  starts.
+
+Without the mail helper, use the `.eml` drafts from the ZIP (or each row's
+**E-mail draft** button). Each draft has the To address, subject, body and
+both attachments already filled in:
 
 - **Outlook (desktop)**: double-click the `.eml`. It opens as a new message
   ready to send (the file carries the `X-Unsent` flag). Check it and press
   **Send**.
 - **Thunderbird**: open the `.eml`, then use **Edit as New Message**.
-- **Webmail (NIC/Gmail)**: use the **Copy e-mails** button and attach the
-  `.docx` and FIR copy from the ZIP.
+- **Webmail**: use the **Copy e-mails** button and attach the `.docx` and FIR
+  copy from the ZIP.
+
+Afterwards set the notice to *Sent* in the register.
 
 ### Replies
 
-Save the nodal officer's reply as `.eml`. In Outlook use *Save As*; in webmail,
-*Download message* or *Show original → Download*. Drop it on the dashboard.
+With the mail helper, replies are found in your inbox automatically, every few
+minutes. **Check mailbox now** on the Cases page checks straight away. The
+helper reads messages without marking them as read, so your mail client still
+shows them as new.
 
-- The reply is matched to its notice by the **`N94-…` reference** in the
-  subject, which a normal "Reply" keeps.
-- If the subject has no reference, it is matched by the sender's e-mail
-  address or domain.
-- If the app still can't decide, you choose the notice yourself.
-- Attachments are saved with the FIR. The notice shows **Reply received** and
-  a pop-up tells you which FIR and bank it belongs to.
+Without the helper, save the reply as `.eml` (in Outlook use *Save As*; in
+webmail, *Download message* or *Show original → Download*) and drop it on the
+Cases page.
+
+Either way, each reply is matched to its notice in this order:
+
+1. by **e-mail threading**: the reply's `In-Reply-To` / `References` point to
+   the notice the helper sent, even if the bank changed the subject;
+2. by the **`N94-…` reference** in the subject, which a normal "Reply" keeps;
+3. by the sender's e-mail address or domain.
+
+What happens next:
+- If the app can't decide, the e-mail goes to **Unmatched replies** on the
+  Cases page. You pick the notice there, or discard it.
+- Attachments are saved with the FIR. The notice shows **Reply received**,
+  and a pop-up tells you which FIR and bank it belongs to.
+- The same e-mail is never recorded twice.
 - Replies sent by post or in other formats can be added with **Attach reply
   files to a notice…**.
 
@@ -153,12 +184,75 @@ All libraries are in `vendor/` (SheetJS, docx and JSZip; see
 [`vendor/README.md`](vendor/README.md)). The page loads nothing from the
 internet.
 
+## Mail helper (automatic sending and replies)
+
+A web page cannot send e-mail or read a mailbox by itself, so the tool comes
+with a small companion program, the **mail helper** (`mail-helper/`).
+
+- It runs on the officer's own computer and listens only on `127.0.0.1`.
+- It sends notices through your mail server (SMTP) and checks your inbox for
+  replies (IMAP).
+- It needs [Node.js](https://nodejs.org) 18 or newer (LTS) and nothing else.
+  There is no `npm install` step.
+
+**Start it**
+
+- Windows: double-click `mail-helper\Start-Mail-Helper.bat`.
+- Linux / macOS: run `mail-helper/start-mail-helper.sh`.
+
+The window shows a **pairing code**. Keep the window open while you work.
+
+**Set it up in the app** (once): click **Mail** in the top bar.
+
+1. Enter the pairing code and click **Connect**.
+2. Fill in:
+   - your name and official e-mail;
+   - your login and password;
+   - the SMTP and IMAP server names and ports.
+3. Click **Save & test connection**. Both checks should say **OK**. The header
+   then shows **Mail: connected**.
+
+**Server settings**
+
+| Mail service | SMTP (sending) | IMAP (mailbox) | Notes |
+|---|---|---|---|
+| Gmail / Google Workspace | `smtp.gmail.com` 465 SSL/TLS | `imap.gmail.com` 993 SSL/TLS | Turn on 2-step verification and create an **app password** |
+| Microsoft 365 / Outlook.com | `smtp.office365.com` 587 STARTTLS | `outlook.office365.com` 993 SSL/TLS | Your admin must allow SMTP AUTH and IMAP for the mailbox |
+| Official / departmental mail | ask your mail administrator | ask your mail administrator | Confirm that SMTP and IMAP access is allowed for your account |
+
+**Security**
+- **Pairing code:** every request from the app must carry it, so other web
+  pages cannot use the helper. Requests for other host names or from other
+  websites are also refused.
+- **Password:** kept in the helper's memory and never stored in the browser.
+  It is written to disk (`%APPDATA%\BNSS94MailHelper\config.json`, or
+  `~/.bnss94-mail-helper/`) only if you tick *Remember password*. Otherwise
+  you enter it again after restarting the helper.
+- **Encryption:** the helper refuses to send your password over an
+  unencrypted connection, and it verifies the server's certificate unless you
+  tick the *internal / self-signed certificate* box.
+- **Sending:** nothing is sent without your confirmation.
+- **Replies:** found replies wait in the helper's settings folder (`inbox/`)
+  until the app has saved them, then they are deleted there.
+- **Restarting:** `--new-code` issues a new pairing code; `--port` changes the
+  port (default 8794).
+
+**Limits**
+- Logging in with OAuth / "Sign in with Microsoft/Google" is not supported.
+  Use an app password, or ask your administrator for SMTP/IMAP access.
+- The mailbox is checked only while the helper is running.
+- If a check fails, the **Mail** badge turns red. Hover over it to see the
+  error.
+
 ## Data privacy
 
-- Files are read by the browser on your computer. Nothing is uploaded or sent
-  anywhere. The page's Content-Security-Policy (`connect-src 'none'`) stops it
-  from making any network request, and the end-to-end test checks that none
-  are made.
+- Files are read by the browser on your computer. The page's
+  Content-Security-Policy allows it to talk only to the mail helper on the
+  same computer (`127.0.0.1`) and blocks every other network request. The
+  end-to-end tests check this.
+- With the mail helper, notices and FIR copies leave the computer only as
+  e-mails sent through **your own mail server** to the nodal officers. Replies
+  are read from your own mailbox. No other server is involved.
 - **Case data is stored in this browser's IndexedDB, on this computer only.**
   That covers the NCRP rows, FIR copy, notices and replies. Anyone who can use
   this Windows/browser profile can open them, so use the tool only on an
@@ -244,7 +338,15 @@ node tests/run-tests.js      # logic on the samples, incl. .eml round-trips (no 
 ```
 
 ```bash
+node tests/mail-helper-tests.js   # mail helper against mock SMTP/IMAP servers (TLS tests need openssl)
+```
+
+```bash
 node tests/e2e.js            # drives index.html in headless Chromium (needs Playwright)
+```
+
+```bash
+node tests/e2e-mail.js       # app + mail helper + mock mail servers: send all, automatic reply pick-up
 ```
 
 ```bash
@@ -261,6 +363,8 @@ Code layout (plain scripts, no build step; the pure modules also load in Node):
 - `js/outputs.js`: `.docx`, `.xlsx`, `.eml` and ZIP builders
 - `js/store.js`: IndexedDB case store and backup/restore
 - `js/app.js`: UI
+- `mail-helper/`: optional local mail helper (`server.js` API, `smtp.js`,
+  `imap.js`, launchers)
 - `samples/`: synthetic NCRP export (39 rows, 8 Ack nos, 3 layers, suspect
   identifiers, put-on-hold amounts), nodal sheet and FIR copy. All names,
   numbers and e-mails are invented.
