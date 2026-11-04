@@ -15,3 +15,8 @@ data/
 node_modules/
 .DS_Store
 Thumbs.db
+
+# E-mail drafts/replies and case backups contain case data
+*.eml
+*.msg
+*.bnss94.json
