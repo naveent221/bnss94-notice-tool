@@ -164,7 +164,8 @@ ul.checklist li.warnitem { color: var(--warn); }
 .reply { padding: 3px 0; font-size: .85rem; }
 .reply.new { font-weight: 600; color: var(--ok); }
 table.data td.wrap { word-break: break-word; max-width: 280px; }
-.nowrap { white-space: nowrap; }
+.nowrap { min-width: 230px; }
+.nowrap .btn { margin-bottom: 3px; }
 .btn-danger { color: var(--bad); border-color: var(--bad); }
 .danger-zone { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .mailpreview { font-family: ui-monospace, Consolas, monospace; font-size: .85rem; white-space: pre-wrap; text-align: left !important; }
@@ -172,3 +173,8 @@ table.data td.mono.wrap { white-space: normal; word-break: break-all; max-width:
 .reqmore { display: inline-block; font-size: .78rem; }
 .reqmore summary { cursor: pointer; color: var(--primary); }
 .reqmore[open] { display: flex; flex-wrap: wrap; gap: 4px; }
+.badge-muted { background: rgba(127,127,127,.15); color: var(--muted); }
+.ok-text { color: var(--ok); }
+.dlg label.inline { flex-direction: row; align-items: center; gap: 6px; align-self: flex-end; }
+.maptable input[type=text] { width: 100%; }
+.btn-send { border-color: var(--primary); color: var(--primary); font-weight: 600; }

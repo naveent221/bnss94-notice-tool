@@ -15,7 +15,8 @@
   var KEYS = {
     txnMap: 'bnss94.txnMapping', nodalMap: 'bnss94.nodalMapping', settings: 'bnss94.settings',
     template: 'bnss94.template', subject: 'bnss94.emailSubject', body: 'bnss94.emailBody',
-    overrides: 'bnss94.bankOverrides', emails: 'bnss94.manualEmails', replyDays: 'bnss94.replyDays'
+    overrides: 'bnss94.bankOverrides', emails: 'bnss94.manualEmails', replyDays: 'bnss94.replyDays',
+    helperPort: 'bnss94.helperPort', helperCode: 'bnss94.helperCode'
   };
   function load(key, fallback) {
     try { var v = window.localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; }
@@ -233,6 +234,7 @@
     return S.getAll('cases').then(function (list) {
       state.cases = list.sort(function (a, b) { return String(b.updatedAt).localeCompare(String(a.updatedAt)); });
       renderDashboard();
+      return renderUnmatched();
     });
   }
 
@@ -947,6 +949,9 @@
         el('td', { class: 'nowrap' }, [
           el('button', { type: 'button', class: 'btn btn-small', text: 'Preview', onclick: function () { previewNotice(g); } }), ' ',
           el('button', { type: 'button', class: 'btn btn-small', text: '.docx', onclick: function () { downloadOne(g, 'docx'); } }), ' ',
+          el('button', { type: 'button', class: 'btn btn-small btn-send', text: g.notice && g.notice.sentAt ? 'Send again' : 'Send',
+            title: mailReady() ? 'Send this notice by e-mail now' : 'Set up the mail helper under “Mail” to send directly',
+            disabled: !emails || !mailReady() || mail.sending, onclick: function () { sendNotices([g]); } }), ' ',
           el('button', { type: 'button', class: 'btn btn-small', text: 'E-mail draft', disabled: !emails, onclick: function () { downloadOne(g, 'eml'); } }), ' ',
           el('button', { type: 'button', class: 'btn btn-small', text: 'Copy e-mails', disabled: !emails, onclick: function () { copyText(emails); } })
         ])
@@ -954,6 +959,7 @@
     });
     var none = !state.recipients.filter(sendable).length;
     $('btn-zip').disabled = none; $('btn-xlsx').disabled = !state.analysis; $('btn-copy-tsv').disabled = none;
+    $('btn-send-all').disabled = none || !mailReady() || mail.sending;
   }
 
   // ------------------------------------------------------------- register
@@ -968,6 +974,7 @@
       n.dueAt = new Date(Date.now() + days * 864e5).toISOString();
     }
     scheduleSave();
+    setTimeout(syncWatch, 600);
   }
 
   function renderRegister() {
@@ -991,7 +998,8 @@
       }));
       t.appendChild(el('tr', { class: overdue ? 'unmatched' : '' }, [
         el('td', { class: 'mono', text: n.ref }), el('td', { text: n.recipientName }), el('td', null, [sel]),
-        el('td', { text: fmtIso(n.sentAt) }), el('td', null, [fmtIso(n.dueAt), overdue ? ' ' : null, overdue ? badge('overdue', 'bad') : null]),
+        el('td', { title: n.sentTo ? 'Sent by e-mail to ' + n.sentTo.join(', ') : null }, [fmtIso(n.sentAt), n.sentVia === 'email' ? ' ' : null, n.sentVia === 'email' ? badge('e-mailed', 'ok') : null]),
+        el('td', null, [fmtIso(n.dueAt), overdue ? ' ' : null, overdue ? badge('overdue', 'bad') : null]),
         el('td', null, [replies]),
         el('td', null, [el('button', { type: 'button', class: 'btn btn-small', text: 'Remove', title: 'Remove this notice from the register', onclick: function () {
           if (!window.confirm('Remove notice ' + n.ref + ' from the register? Saved replies stay in the backup only if you exported one.')) return;
@@ -1012,8 +1020,13 @@
   }
 
   // ============================================================== REPLIES
-  /** Store files as reply attachments and add a reply record to the notice. */
+  /**
+   * Store files as reply attachments and add a reply record to the notice.
+   * Resolves to false (and stores nothing) if this e-mail was already recorded.
+   */
   function addReply(caseRec, notice, info, files) {
+    notice.replies = notice.replies || [];
+    if (info.messageId && notice.replies.some(function (r) { return r.messageId === info.messageId; })) return Promise.resolve(false);
     var stored = [];
     return Promise.all(files.map(function (f) {
       var rec = { id: newId('reply'), firNo: caseRec.firNo, kind: 'reply', ref: notice.ref, name: f.name, type: f.type || 'application/octet-stream',
@@ -1021,78 +1034,112 @@
       stored.push({ id: rec.id, name: rec.name });
       return S.put('files', rec);
     })).then(function () {
-      notice.replies = notice.replies || [];
-      notice.replies.push({ at: (info.date || new Date()).toISOString(), from: info.from || '', subject: info.subject || '', method: info.method || 'manual', files: stored, reviewed: false });
+      notice.replies.push({ at: (info.date || new Date()).toISOString(), from: info.from || '', subject: info.subject || '', method: info.method || 'manual',
+        messageId: info.messageId || null, source: info.source || 'manual', files: stored, reviewed: false });
       if (notice.status === 'generated' || notice.status === 'sent') notice.status = 'replied';
       caseRec.updatedAt = new Date().toISOString();
-      return S.put('cases', caseRec);
+      return S.put('cases', caseRec).then(function () { return true; });
     });
   }
 
-  /** Import reply .eml files: parse, match to a notice (any case), save attachments, prompt. */
-  function importReplies(fileList) {
-    var files = Array.prototype.slice.call(fileList || []);
-    if (!files.length) return;
-    var box = clear($('reply-results'));
-    flushSave().then(function () { return S.getAll('cases'); }).then(function (cases) {
-      var notices = [];
-      cases.forEach(function (c) { (c.notices || []).forEach(function (n) { notices.push({ ref: n.ref, emails: n.emails || [], status: n.status, _case: c, _notice: n }); }); });
-      var results = [];
-      return files.reduce(function (p, f) {
-        return p.then(function () { return fileBytes(f); }).then(function (bytes) {
-          var mail = M.parseEml(bytes);
-          var m = M.matchReply(mail, notices);
-          var original = { name: (B.safeFileName(mail.subject || 'reply').slice(0, 60) || 'reply') + '.eml', type: 'message/rfc822', data: bytes };
-          var attachments = [original].concat(mail.attachments.map(function (a) { return { name: a.name, type: a.type, data: a.data }; }));
-          if (m.notice) {
-            var info = { date: mail.date, from: mail.from, subject: mail.subject, method: m.method };
-            return addReply(m.notice._case, m.notice._notice, info, attachments).then(function () {
-              results.push({ ok: true, mail: mail, n: m.notice, method: m.method, count: mail.attachments.length });
-            });
-          }
-          results.push({ ok: false, mail: mail, candidates: m.candidates, attachments: attachments, fileName: f.name });
-        });
-      }, Promise.resolve()).then(function () { return results; });
-    }).then(function (results) {
-      var items = [];
-      results.forEach(function (r) {
-        if (r.ok) {
-          items.push(el('span', null, ['Reply received from ' + (r.n._notice.recipientName) + ' for FIR ' + r.n._case.firNo + ' (' + r.n.ref + ') — ' +
-            r.count + ' attachment(s) saved' + (r.method === 'sender' ? ' (matched by sender address)' : '') + '. ',
-            el('button', { type: 'button', class: 'btn btn-small', text: 'Open case', onclick: function () { $('dlg-prompt').close(); openCase(r.n._case.firNo, 'step-generate'); } })]));
-        } else {
-          box.appendChild(unmatchedReply(r));
-        }
-      });
-      var bad = results.filter(function (r) { return !r.ok; }).length;
-      if (bad) items.push(bad + ' e-mail(s) could not be matched automatically — choose the notice below the drop area.');
-      if (items.length) prompt(results.some(function (r) { return r.ok; }) ? 'Reply received' : 'Reply not matched', items);
-      refreshCases();
-      if (state.cur && state.cur.firNo) S.get('cases', state.cur.firNo).then(function (c) { if (c && state.cur) { state.cur.notices = c.notices; renderRegister(); } });
-    }).catch(function (e) { prompt('Could not read the e-mail', e.message); });
+  function allNotices(cases) {
+    var out = [];
+    cases.forEach(function (c) { (c.notices || []).forEach(function (n) { out.push({ ref: n.ref, emails: n.emails || [], status: n.status, messageId: n.messageId, _case: c, _notice: n }); }); });
+    return out;
   }
 
-  function unmatchedReply(r) {
-    var sel = el('select', { 'aria-label': 'Notice for this reply' }, [el('option', { value: '', text: '— choose notice —' })]);
-    var pool = [];
-    state.cases.forEach(function (c) { (c.notices || []).forEach(function (n) { pool.push({ c: c, n: n }); }); });
-    var prefer = (r.candidates || []).map(function (x) { return x.ref; });
-    pool.sort(function (a, b) { return (prefer.indexOf(b.n.ref) >= 0) - (prefer.indexOf(a.n.ref) >= 0); });
-    pool.forEach(function (p, i) { sel.appendChild(el('option', { value: String(i), text: 'FIR ' + p.c.firNo + ' · ' + p.n.ref + ' · ' + p.n.recipientName })); });
-    var div = el('div', { class: 'alert alert-warn' }, [
-      'Not matched: “' + (r.mail.subject || r.fileName) + '” from ' + (r.mail.from || 'unknown sender') + '. ', sel, ' ',
-      el('button', { type: 'button', class: 'btn btn-small', text: 'Attach to notice', onclick: function () {
-        var p = pool[+sel.value];
-        if (!sel.value || !p) return;
-        S.get('cases', p.c.firNo).then(function (c) {
-          var n = c.notices.filter(function (x) { return x.ref === p.n.ref; })[0];
-          return addReply(c, n, { date: r.mail.date, from: r.mail.from, subject: r.mail.subject, method: 'manual' }, r.attachments).then(function () {
-            div.remove(); toast('Reply saved to ' + n.ref); refreshCases();
+  /**
+   * Match reply e-mails to notices (in any case), save them and prompt.
+   * @param items  [{ name, bytes, helperId? }]
+   * @param source 'file' (dropped by the user) | 'mailbox' (picked up by the mail helper)
+   * @returns Promise<[helperIds that were handled]>
+   */
+  function processReplies(items, source) {
+    if (!items.length) return Promise.resolve([]);
+    var handled = [], results = [];
+    return flushSave().then(function () { return S.getAll('cases'); }).then(function (cases) {
+      var notices = allNotices(cases);
+      return items.reduce(function (p, it) {
+        return p.then(function () {
+          var mail = M.parseEml(it.bytes);
+          var m = M.matchReply(mail, notices);
+          var original = { name: (B.safeFileName(mail.subject || 'reply').slice(0, 60) || 'reply') + '.eml', type: 'message/rfc822', data: it.bytes };
+          var attachments = [original].concat(mail.attachments.map(function (a) { return { name: a.name, type: a.type, data: a.data }; }));
+          var info = { date: mail.date, from: mail.from, subject: mail.subject, method: m.method, messageId: mail.headers['message-id'] || null, source: source };
+          if (m.notice) {
+            return addReply(m.notice._case, m.notice._notice, info, attachments).then(function (added) {
+              if (it.helperId) handled.push(it.helperId);
+              if (added) results.push({ ok: true, n: m.notice, method: m.method, count: mail.attachments.length });
+            });
+          }
+          // Not matched: keep it so the user can attach it to the right notice later.
+          var rec = { id: newId('unmatched'), kind: 'unmatched', name: original.name, type: original.type, data: it.bytes, firNo: null,
+            subject: mail.subject, from: mail.from, date: info.date ? info.date.toISOString() : null, messageId: info.messageId,
+            candidates: m.candidates.map(function (x) { return x.ref; }), addedAt: new Date().toISOString(), source: source };
+          return S.put('files', rec).then(function () {
+            if (it.helperId) handled.push(it.helperId);
+            results.push({ ok: false, mail: mail });
           });
         });
-      } })
-    ]);
-    return div;
+      }, Promise.resolve());
+    }).then(function () {
+      var lines = [];
+      results.forEach(function (r) {
+        if (!r.ok) return;
+        lines.push(el('span', null, ['Reply received from ' + r.n._notice.recipientName + ' for FIR ' + r.n._case.firNo + ' (' + r.n.ref + ') — ' +
+          r.count + ' attachment(s) saved' + (r.method === 'sender' ? ' (matched by sender address)' : '') + '. ',
+          el('button', { type: 'button', class: 'btn btn-small', text: 'Open case', onclick: function () { $('dlg-prompt').close(); openCase(r.n._case.firNo, 'step-generate'); } })]));
+      });
+      var bad = results.filter(function (r) { return !r.ok; }).length;
+      if (bad) lines.push(bad + ' e-mail(s) could not be matched to a notice — see “Unmatched replies” on the Cases page.');
+      if (lines.length) prompt(results.some(function (r) { return r.ok; }) ? 'Reply received' : 'Reply not matched', lines);
+      return refreshCases();
+    }).then(function () {
+      if (state.cur && state.cur.firNo) {
+        return S.get('cases', state.cur.firNo).then(function (c) { if (c && state.cur) { state.cur.notices = c.notices; renderRegister(); } });
+      }
+    }).then(function () { syncWatch(); return handled; });
+  }
+
+  function importReplies(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    Promise.all(files.map(function (f) { return fileBytes(f).then(function (b) { return { name: f.name, bytes: b }; }); }))
+      .then(function (items) { return processReplies(items, 'file'); })
+      .catch(function (e) { prompt('Could not read the e-mail', e.message); });
+  }
+
+  /** Replies that could not be matched automatically, stored until the user attaches or discards them. */
+  function renderUnmatched() {
+    return S.getAll('files').then(function (files) {
+      var list = files.filter(function (f) { return f.kind === 'unmatched'; }).sort(function (a, b) { return String(b.addedAt).localeCompare(String(a.addedAt)); });
+      var box = clear($('reply-results'));
+      if (!list.length) return;
+      box.appendChild(el('h3', { text: 'Unmatched replies (' + list.length + ')' }));
+      var pool = [];
+      state.cases.forEach(function (c) { (c.notices || []).forEach(function (n) { pool.push({ c: c, n: n }); }); });
+      list.forEach(function (u) {
+        var prefer = u.candidates || [];
+        var options = pool.slice().sort(function (a, b) { return (prefer.indexOf(b.n.ref) >= 0) - (prefer.indexOf(a.n.ref) >= 0); });
+        var sel = el('select', { 'aria-label': 'Notice for this reply' }, [el('option', { value: '', text: '— choose notice —' })]
+          .concat(options.map(function (p, i) { return el('option', { value: String(i), text: 'FIR ' + p.c.firNo + ' · ' + p.n.ref + ' · ' + p.n.recipientName }); })));
+        box.appendChild(el('div', { class: 'alert alert-warn' }, [
+          '“' + (u.subject || u.name) + '” from ' + (u.from || 'unknown sender') + (u.date ? ' (' + fmtIso(u.date) + ')' : '') + '. ', sel, ' ',
+          el('button', { type: 'button', class: 'btn btn-small', text: 'Attach to notice', onclick: function () {
+            var p = options[+sel.value];
+            if (!sel.value || !p) return;
+            var mail = M.parseEml(u.data);
+            var atts = [{ name: u.name, type: u.type, data: u.data }].concat(mail.attachments.map(function (a) { return { name: a.name, type: a.type, data: a.data }; }));
+            S.get('cases', p.c.firNo).then(function (c) {
+              var n = c.notices.filter(function (x) { return x.ref === p.n.ref; })[0];
+              return addReply(c, n, { date: mail.date, from: mail.from, subject: mail.subject, method: 'manual', messageId: u.messageId, source: u.source }, atts);
+            }).then(function () { return S.del('files', u.id); }).then(function () { toast('Reply saved to ' + p.n.ref); refreshCases(); });
+          } }), ' ',
+          el('button', { type: 'button', class: 'btn btn-small', text: 'Discard', onclick: function () {
+            if (window.confirm('Discard this e-mail? It is not linked to any notice.')) S.del('files', u.id).then(renderUnmatched);
+          } })
+        ]));
+      });
+    });
   }
 
   function attachManualReply(fileList) {
@@ -1105,6 +1152,227 @@
     }).then(function (atts) {
       return addReply(state.cur, n, { from: '', subject: '', method: 'manual' }, atts);
     }).then(function () { renderRegister(); toast(files.length + ' reply file(s) saved to ' + ref); });
+  }
+
+  // ================================================================= MAIL
+  // Talks to the local mail helper (mail-helper/) on 127.0.0.1 to send notices
+  // and collect replies. Without it the app works as before (.eml drafts).
+  var mail = { port: load(KEYS.helperPort, 8794), code: load(KEYS.helperCode, ''), status: null, online: false, sending: false };
+
+  function helper(method, path, body) {
+    return fetch('http://127.0.0.1:' + mail.port + path, {
+      method: method, cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'X-BNSS-Token': mail.code },
+      body: body ? JSON.stringify(body) : undefined
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok) { var e = new Error(j.error || ('HTTP ' + r.status)); e.status = r.status; throw e; }
+        return j;
+      });
+    });
+  }
+
+  function mailReady() { return mail.online && mail.status && mail.status.configured && mail.status.hasPassword; }
+
+  function refreshHelper() {
+    if (!mail.code) { mail.online = false; mail.status = null; renderMailBadge(); return Promise.resolve(false); }
+    return helper('GET', '/status').then(function (st) {
+      mail.status = st; mail.online = true; mail.error = null; renderMailBadge(); return true;
+    }).catch(function (e) {
+      mail.online = false; mail.status = null;
+      mail.error = e.status === 401 ? 'Pairing code not accepted — check the code shown in the helper window.' : 'Mail helper is not running on this computer.';
+      renderMailBadge(); return false;
+    });
+  }
+
+  function renderMailBadge() {
+    var b = $('mail-badge'), label, kind;
+    if (!mail.code) { label = 'not set up'; kind = 'muted'; }
+    else if (!mail.online) { label = 'offline'; kind = 'warn'; }
+    else if (!mail.status.configured) { label = 'needs settings'; kind = 'warn'; }
+    else if (!mail.status.hasPassword) { label = 'needs password'; kind = 'warn'; }
+    else if (mail.status.lastError) { label = 'error'; kind = 'bad'; }
+    else { label = 'connected'; kind = 'ok'; }
+    b.textContent = label; b.className = 'badge badge-' + kind;
+    b.title = mail.status && mail.status.lastError ? 'Last mailbox check failed: ' + mail.status.lastError : (mail.error || '');
+    var ready = mailReady();
+    ['btn-send-all', 'btn-check-mail'].forEach(function (id) { if ($(id)) $(id).disabled = !ready; });
+    var hint = $('mail-hint');
+    if (hint) hint.textContent = ready ? 'Sending as ' + mail.status.fromEmail + '. Replies are checked every ' + mail.status.pollMinutes + ' min' +
+      (mail.status.lastCheck ? ' (last check ' + new Date(mail.status.lastCheck).toLocaleTimeString() + ')' : '') + '.'
+      : 'To send directly and pick up replies automatically, start the mail helper and set it up under “Mail”.';
+    if (state.cur && state.analysis) renderEmails();
+  }
+
+  /** Tell the helper which notices to look out for replies to. */
+  var watchTimer = null;
+  function syncWatch() {
+    clearTimeout(watchTimer);
+    watchTimer = setTimeout(function () {
+      if (!mailReady()) return;
+      S.getAll('cases').then(function (cases) {
+        var refs = [], emails = [], ids = [], since = null;
+        allNotices(cases).forEach(function (x) {
+          var n = x._notice;
+          if (['sent', 'replied', 'partial'].indexOf(n.status) < 0) return;
+          refs.push(n.ref);
+          (n.emails || []).forEach(function (e) { if (emails.indexOf(e) < 0) emails.push(e); });
+          if (n.messageId) ids.push(n.messageId);
+          if (n.sentAt && (!since || n.sentAt < since)) since = n.sentAt;
+        });
+        return helper('POST', '/watch', { refs: refs, emails: emails, messageIds: ids, since: since });
+      }).catch(function () {});
+    }, 300);
+  }
+
+  /** Collect replies the helper found in the mailbox. */
+  var polling = false;
+  function pollReplies() {
+    if (!mailReady() || polling) return Promise.resolve();
+    polling = true;
+    return helper('GET', '/replies').then(function (r) {
+      var items = (r.replies || []).map(function (x) { return { name: x.id + '.eml', bytes: M.unbase64(x.base64), helperId: x.id }; });
+      return processReplies(items, 'mailbox');
+    }).then(function (ids) {
+      if (ids && ids.length) return helper('POST', '/replies/ack', { ids: ids });
+    }).catch(function () {}).then(function () { polling = false; });
+  }
+
+  function checkMailNow() {
+    var btn = $('btn-check-mail');
+    btn.disabled = true;
+    return helper('POST', '/check').then(function (r) {
+      toast(r.skipped ? 'Nothing to check: ' + r.skipped : 'Mailbox checked — ' + (r.found || 0) + ' new reply(ies)');
+      return pollReplies();
+    }).catch(function (e) { prompt('Mailbox check failed', e.message); })
+      .then(refreshHelper).then(function () { btn.disabled = !mailReady(); });
+  }
+
+  // ---- mail settings dialog
+  var PRESETS = {
+    gmail: { smtp: { host: 'smtp.gmail.com', port: 465, secure: true }, imap: { host: 'imap.gmail.com', port: 993, secure: true } },
+    m365: { smtp: { host: 'smtp.office365.com', port: 587, secure: false }, imap: { host: 'outlook.office365.com', port: 993, secure: true } }
+  };
+
+  function openMail() {
+    $('m-port').value = String(mail.port);
+    $('m-code').value = mail.code;
+    $('m-test-result').textContent = '';
+    refreshHelper().then(fillMailForm);
+    $('dlg-mail').showModal();
+  }
+
+  function fillMailForm() {
+    var st = mail.status;
+    $('m-conn').textContent = mail.online ? 'Connected to the mail helper on this computer.' : (mail.code ? mail.error : 'Start the mail helper (mail-helper/Start-Mail-Helper.bat), then enter the pairing code it shows.');
+    $('m-conn').className = mail.online ? 'ok-text' : 'error';
+    show('m-account', mail.online);
+    if (!mail.online) return;
+    $('m-fromName').value = st.fromName || state.settings.officerName || '';
+    $('m-fromEmail').value = st.fromEmail || state.settings.officerEmail || '';
+    $('m-user').value = st.user || st.fromEmail || state.settings.officerEmail || '';
+    $('m-pass').value = '';
+    $('m-pass').placeholder = st.hasPassword ? 'saved — leave blank to keep' : 'mailbox password / app password';
+    $('m-remember').checked = !!st.rememberPassword;
+    var sm = st.smtp || {}, im = st.imap || {};
+    $('m-smtp-host').value = sm.host || ''; $('m-smtp-port').value = sm.port || ''; $('m-smtp-sec').value = sm.secure === false ? 'starttls' : 'tls';
+    $('m-imap-host').value = im.host || ''; $('m-imap-port').value = im.port || ''; $('m-imap-sec').value = im.secure === false ? 'starttls' : 'tls';
+    $('m-poll').value = String(st.pollMinutes || 5);
+    $('m-sent').checked = st.saveToSent !== false;
+    $('m-selfsigned').checked = sm.rejectUnauthorized === false;
+  }
+
+  function connectHelper() {
+    mail.port = parseInt($('m-port').value, 10) || 8794;
+    mail.code = $('m-code').value.trim().toUpperCase();
+    save(KEYS.helperPort, mail.port); save(KEYS.helperCode, mail.code);
+    refreshHelper().then(function () { fillMailForm(); if (mailReady()) { syncWatch(); pollReplies(); } });
+  }
+
+  function mailFormBody() {
+    var sec = function (id) { return $(id).value === 'tls'; };
+    var body = {
+      fromName: $('m-fromName').value.trim(), fromEmail: $('m-fromEmail').value.trim(), user: $('m-user').value.trim(),
+      rememberPassword: $('m-remember').checked, pollMinutes: parseInt($('m-poll').value, 10) || 5, saveToSent: $('m-sent').checked,
+      smtp: { host: $('m-smtp-host').value.trim(), port: parseInt($('m-smtp-port').value, 10) || (sec('m-smtp-sec') ? 465 : 587), secure: sec('m-smtp-sec') },
+      imap: { host: $('m-imap-host').value.trim(), port: parseInt($('m-imap-port').value, 10) || (sec('m-imap-sec') ? 993 : 143), secure: sec('m-imap-sec') }
+    };
+    body.smtp.rejectUnauthorized = body.imap.rejectUnauthorized = !$('m-selfsigned').checked;
+    if ($('m-pass').value) body.pass = $('m-pass').value;
+    return body;
+  }
+
+  function saveMail(thenTest) {
+    var b = mailFormBody();
+    var missing = [];
+    if (!B.extractEmails(b.fromEmail).length) missing.push('your e-mail address');
+    if (!b.user) missing.push('login');
+    if (!b.smtp.host) missing.push('SMTP server');
+    if (!b.imap.host) missing.push('IMAP server');
+    if (missing.length) { $('m-test-result').textContent = 'Please fill in: ' + missing.join(', '); return Promise.resolve(); }
+    $('m-test-result').textContent = thenTest ? 'Saving and testing…' : 'Saving…';
+    return helper('POST', '/config', b).then(function (st) {
+      mail.status = st; $('m-pass').value = ''; fillMailForm(); renderMailBadge();
+      if (!thenTest) { $('m-test-result').textContent = 'Saved.'; return; }
+      return helper('POST', '/test').then(function (r) {
+        var t = function (name, x) { return name + ': ' + (x.ok ? 'OK' : x.error); };
+        $('m-test-result').textContent = t('Sending (SMTP)', r.smtp) + ' · ' + t('Mailbox (IMAP)', r.imap);
+        $('m-test-result').className = r.smtp.ok && r.imap.ok ? 'ok-text small' : 'error small';
+      });
+    }).then(function () { syncWatch(); return refreshHelper(); })
+      .catch(function (e) { $('m-test-result').textContent = 'Failed: ' + e.message; $('m-test-result').className = 'error small'; });
+  }
+
+  // ---- sending
+  function b64(bytes) { return M.base64(bytes); }
+
+  /** Send notices by e-mail through the helper, one by one, after one confirmation. */
+  function sendNotices(groups, opts) {
+    opts = opts || {};
+    if (!mailReady()) { openMail(); return; }
+    groups = groups.filter(function (g) { return g.emails.length; });
+    if (!groups.length) { prompt('Nothing to send', 'None of the chosen recipients has a nodal e-mail ID.'); return; }
+    if (!preflight(groups)) return;
+    ensureNotices(groups);
+    var lines = groups.map(function (g) { return '• ' + g.bankName + ' → ' + g.emails.join(', ') + (g.notice && g.notice.sentAt ? '   (ALREADY SENT ' + fmtIso(g.notice.sentAt) + ')' : ''); });
+    if (!window.confirm('Send ' + groups.length + ' notice(s) by e-mail from ' + mail.status.fromEmail + '?\n\n' + lines.join('\n') +
+      '\n\nEach e-mail carries the notice (.docx) and the FIR copy. Check the notices (Preview) before sending.')) return;
+    var s = currentSettings(), ci = caseInfo(), status = $('gen-status'), ok = [], failed = [], warnings = [];
+    mail.sending = true; renderEmails();
+    return firCopy().then(function (fc) {
+      return groups.reduce(function (p, g, i) {
+        return p.then(function () {
+          status.textContent = 'Sending ' + (i + 1) + ' of ' + groups.length + ': ' + g.bankName + '…';
+          return O.noticeDocx(g, state.templates, s, ci).then(O.bytesOf).then(function (docBytes) {
+            var values = T.valuesFor(g, s, ci);
+            var atts = [{ name: g.fileName, type: window.BNSSOutputs.DOCX_MIME, base64: b64(docBytes) }];
+            if (fc) atts.push({ name: fc.name, type: fc.type, base64: b64(fc.data) });
+            return helper('POST', '/send', { ref: g.noticeRef, to: g.emails, subject: T.fillText(state.templates.subject, values), text: T.fillText(state.templates.body, values), attachments: atts });
+          }).then(function (r) {
+            var n = g.notice;
+            n.sentAt = null; setStatus(n, 'sent');
+            Object.assign(n, { sentVia: 'email', messageId: r.messageId, sentTo: r.accepted, rejectedTo: r.rejected, sentFrom: mail.status.fromEmail });
+            ok.push(g.bankName + (r.rejected.length ? ' (rejected: ' + r.rejected.map(function (x) { return x.rcpt; }).join(', ') + ')' : ''));
+            if (r.warning) warnings.push(g.bankName + ': ' + r.warning);
+          }).catch(function (e) { failed.push(g.bankName + ': ' + e.message); });
+        });
+      }, Promise.resolve());
+    }).then(function () {
+      mail.sending = false;
+      scheduleSave();
+      status.textContent = ok.length + ' sent' + (failed.length ? ', ' + failed.length + ' failed' : '') + '.';
+      renderRecipients();
+      syncWatch();
+      var items = ok.map(function (x) { return '✓ Sent: ' + x; }).concat(failed.map(function (x) { return '✗ Not sent — ' + x; })).concat(warnings.map(function (x) { return '! ' + x; }));
+      prompt(failed.length ? 'Some notices were not sent' : 'Notices sent', items);
+    });
+  }
+
+  function sendAll() {
+    computeRecipients();
+    var groups = state.recipients.filter(sendable).filter(function (g) { return !g.notice || !g.notice.sentAt; });
+    if (!groups.length) { prompt('Nothing to send', 'All notices with an e-mail ID have already been sent. Use the Send button on a row to send one again.'); return; }
+    sendNotices(groups);
   }
 
   // ============================================================== PREVIEW
@@ -1267,6 +1535,19 @@
     $('btn-xlsx').addEventListener('click', downloadXlsx);
     $('btn-copy-tsv').addEventListener('click', function () { copyText(O.emailTsv(state.recipients.filter(sendable))); });
     $('btn-mark-all-sent').addEventListener('click', markAllSent);
+    $('btn-send-all').addEventListener('click', sendAll);
+    $('btn-mail').addEventListener('click', openMail);
+    $('btn-check-mail').addEventListener('click', checkMailNow);
+    $('m-connect').addEventListener('click', connectHelper);
+    $('m-save').addEventListener('click', function () { saveMail(false); });
+    $('m-test').addEventListener('click', function () { saveMail(true); });
+    $('m-close').addEventListener('click', function () { $('dlg-mail').close(); });
+    $('m-preset').addEventListener('change', function () {
+      var p = PRESETS[this.value];
+      if (!p) return;
+      $('m-smtp-host').value = p.smtp.host; $('m-smtp-port').value = p.smtp.port; $('m-smtp-sec').value = p.smtp.secure ? 'tls' : 'starttls';
+      $('m-imap-host').value = p.imap.host; $('m-imap-port').value = p.imap.port; $('m-imap-sec').value = p.imap.secure ? 'tls' : 'starttls';
+    });
     $('file-reply-manual').addEventListener('change', function () { attachManualReply(this.files); this.value = ''; });
 
     $('btn-settings').addEventListener('click', openSettings);
@@ -1322,6 +1603,10 @@
       var replies = [], overdue = [];
       state.cases.forEach(function (c) { noticeAlerts(c).forEach(function (a) { (a.type === 'reply' ? replies : a.type === 'overdue' ? overdue : []).push('FIR ' + c.firNo + ': ' + a.text); }); });
       if (replies.length || overdue.length) prompt('Notices needing attention', replies.concat(overdue));
+      // Mail helper: connect, tell it what to watch, collect replies — now and every minute.
+      var tick = function () { return refreshHelper().then(function (ok) { if (ok && mailReady()) { syncWatch(); return pollReplies(); } }); };
+      tick();
+      setInterval(tick, 60000);
     });
   }
 

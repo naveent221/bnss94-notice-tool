@@ -5,8 +5,12 @@
   "description": "Offline browser tool to analyse NCRP Layer 1 accounts and draft Section 94 BNSS notices per bank.",
   "license": "MIT",
   "scripts": {
-    "test": "node tests/run-tests.js",
-    "test:e2e": "node tests/e2e.js",
-    "samples": "node tools/make-samples.js"
+    "test": "node tests/run-tests.js && node tests/mail-helper-tests.js",
+    "test:e2e": "node tests/e2e.js && node tests/e2e-mail.js",
+    "samples": "node tools/make-samples.js",
+    "mail-helper": "node mail-helper/mail-helper.js"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
