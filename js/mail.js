@@ -102,7 +102,8 @@
     if (m.cc && m.cc.length) h.push('Cc: ' + m.cc.join(', '));
     h.push('Subject: ' + encodeWord(m.subject));
     h.push('Date: ' + (m.date || new Date()).toUTCString().replace('GMT', '+0000'));
-    h.push('Message-ID: <' + (m.messageId || boundary.slice(13)) + '@bnss94.local>');
+    var mid = String(m.messageId || boundary.slice(13)).replace(/[<>\s]/g, '');
+    h.push('Message-ID: <' + (mid.indexOf('@') > 0 ? mid : mid + '@bnss94.local') + '>');
     if (m.unsent !== false) h.push('X-Unsent: 1');
     h.push('MIME-Version: 1.0');
     h.push('Content-Type: multipart/mixed; boundary="' + boundary + '"');
@@ -254,6 +255,14 @@
    * @returns { notice, method: 'ref'|'sender'|'none'|'ambiguous', candidates }
    */
   function matchReply(mail, notices) {
+    // 1. Mail threading: the reply points at the Message-ID of the notice we sent.
+    var h = mail.headers || {};
+    var thread = (h['in-reply-to'] || '') + ' ' + (h.references || '');
+    if (thread.trim()) {
+      var byThread = notices.filter(function (n) { return n.messageId && thread.indexOf(n.messageId) >= 0; })[0];
+      if (byThread) return { notice: byThread, method: 'thread', candidates: [byThread] };
+    }
+    // 2. The notice reference (N94-…) in the subject or body.
     var refs = ((mail.subject || '') + '\n' + (mail.text || '')).match(REF_RE) || [];
     for (var i = 0; i < refs.length; i++) {
       var r = refs[i].toUpperCase();
