@@ -1,0 +1,17 @@
+# Never commit real case data or generated outputs
+*.xlsx
+*.xls
+*.csv
+*.docx
+*.pdf
+*.zip
+output/
+data/
+
+# Synthetic samples are allowed
+!samples/
+!samples/*
+
+node_modules/
+.DS_Store
+Thumbs.db
