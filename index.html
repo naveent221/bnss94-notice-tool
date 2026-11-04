@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Privacy: the page may only talk to the optional mail helper on this same computer (127.0.0.1).
+     Every other network request (fetch/XHR/WebSocket/beacons to the internet) is blocked. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src http://127.0.0.1:* http://localhost:*; form-action 'none'; base-uri 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<title>BNSS94 Notice Tool</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>BNSS94 Notice Tool</h1>
+    <span class="badge badge-ok" title="All processing happens in this browser. Nothing is uploaded.">Offline · data stays on this computer</span>
+    <span class="badge badge-warn hidden" id="storage-warning" title="This browser does not allow saving. Use Backup before closing.">Not saving — memory only</span>
+  </div>
+  <nav>
+    <button type="button" id="btn-home" class="btn">Cases <span class="count hidden" id="alert-count"></span></button>
+    <button type="button" id="btn-mail" class="btn">Mail <span class="badge badge-muted" id="mail-badge">not set up</span></button>
+    <button type="button" id="btn-settings" class="btn">Officer settings</button>
+    <button type="button" id="btn-template" class="btn">Templates</button>
+  </nav>
+</header>
+
+<main>
+  <div id="officer-warning" class="alert alert-warn hidden">
+    Officer details are not set. <button type="button" class="linklike" data-open="settings">Enter them once</button> — they fill the notice signature block and e-mail drafts.
+  </div>
+
+  <!-- ========================= DASHBOARD ========================= -->
+  <div id="view-dashboard">
+    <section class="card" id="alerts-card">
+      <h2>Alerts</h2>
+      <ul class="alerts" id="alerts"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Replies from nodal officers</h2>
+      <label class="drop drop-slim" id="drop-reply">
+        <input type="file" id="file-reply" accept=".eml,message/rfc822" multiple>
+        <strong>Drop reply e-mails (.eml) here</strong>
+        <span>With the mail helper running, replies are picked up from your mailbox automatically — <button type="button" class="linklike" id="btn-check-mail">check mailbox now</button>.</span>
+        <span>Save the nodal officer's reply from your mail client as .eml ("Download message" / "Save as"). The reply is matched to its notice by the reference code (N94-…) in the subject; attachments are saved with the FIR.</span>
+      </label>
+      <div id="reply-results"></div>
+    </section>
+
+    <section class="card">
+      <h2>Cases (by FIR number)</h2>
+      <div class="actions">
+        <button type="button" id="btn-new-case" class="btn btn-primary">New case</button>
+        <button type="button" id="btn-backup" class="btn">Backup all cases</button>
+        <label class="btn">Restore backup<input type="file" id="file-restore" accept=".json,application/json" class="hidden"></label>
+      </div>
+      <div class="scroll"><table class="data" id="cases"></table></div>
+    </section>
+
+    <section class="card">
+      <h2>Nodal officers directory</h2>
+      <p class="muted small" id="dir-status">No nodal officers sheet loaded yet.</p>
+      <label class="drop drop-slim" id="drop-nodal">
+        <input type="file" id="file-nodal" accept=".xlsx,.xls,.csv">
+        <strong>Upload / replace nodal officers sheet</strong>
+        <span>Banks, payment entities, telecom operators and platforms with their nodal e-mail IDs. Loaded once and used for every case.</span>
+      </label>
+      <div id="nodal-mapping" class="hidden">
+        <div id="nodal-sheets"></div>
+        <table class="maptable" id="nodal-map"></table>
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="btn-dir-save">Use this directory</button>
+          <span class="error" id="dir-errors"></span>
+        </div>
+      </div>
+      <details class="preview" id="dir-details">
+        <summary>Show directory</summary>
+        <div class="scroll"><table class="data" id="dir-table"></table></div>
+      </details>
+    </section>
+  </div>
+
+  <!-- ========================= CASE VIEW ========================= -->
+  <div id="view-case" class="hidden">
+    <div class="casebar">
+      <button type="button" class="btn btn-small" id="btn-back">← All cases</button>
+      <h2 id="case-title">New case</h2>
+      <span class="muted small" id="save-status"></span>
+    </div>
+
+    <section class="card" id="step-case">
+      <h2><span class="step">1</span> FIR details</h2>
+      <div class="grid2">
+        <div class="form">
+          <label><span>FIR number <span class="req">*</span></span><input type="text" id="c-firNo" placeholder="e.g. 123/2026"></label>
+          <label><span>FIR date <span class="req">*</span></span><input type="text" id="c-firDate" placeholder="DD-MM-YYYY"></label>
+          <label><span>Police station <span class="req">*</span></span><input type="text" id="c-policeStation" placeholder="e.g. Cyber Crime PS, Hyderabad"></label>
+          <label><span>Sections of law <span class="req">*</span></span><input type="text" id="c-sections" placeholder="e.g. 318(4), 319(2) BNS; 66C, 66D IT Act"></label>
+          <label>Complainant(s) <input type="text" id="c-complainant"></label>
+          <div class="formrow">
+            <label>Records period from <input type="text" id="c-periodFrom" placeholder="DD-MM-YYYY"></label>
+            <label>to <input type="text" id="c-periodTo" placeholder="DD-MM-YYYY"></label>
+          </div>
+          <p class="small muted">The period is used for CDR / IPDR / IP-log requests.</p>
+        </div>
+        <div>
+          <label class="drop drop-slim" id="drop-fir">
+            <input type="file" id="file-fir" accept=".pdf,image/*">
+            <strong>FIR copy <span class="req">*</span></strong>
+            <span>PDF or image. Attached to every e-mail draft and included in the ZIP.</span>
+            <span class="filelist" id="fir-file"></span>
+          </label>
+          <h3>Mandatory fields</h3>
+          <ul class="checklist" id="checklist"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="step-upload">
+      <h2><span class="step">2</span> NCRP transaction export</h2>
+      <label class="drop" id="drop-txn">
+        <input type="file" id="file-txn" accept=".xlsx,.xls,.csv" multiple>
+        <strong>NCRP transaction export <span class="req">*</span></strong>
+        <span>Excel / CSV — one or more files, any number of Acknowledgement numbers. Drop here or click.</span>
+        <span class="filelist" id="txn-files"></span>
+      </label>
+      <div id="upload-errors"></div>
+      <div id="mapping-box" class="hidden">
+        <h3>Map columns</h3>
+        <p class="muted small">Columns were guessed from the headers. Check each one, then analyse. Your choices are remembered.</p>
+        <div id="txn-sheets"></div>
+        <table class="maptable" id="txn-map"></table>
+        <details class="preview">
+          <summary>Preview first rows</summary>
+          <div class="scroll"><table class="data" id="txn-preview"></table></div>
+        </details>
+        <div class="actions">
+          <button type="button" id="btn-analyse" class="btn btn-primary">Analyse</button>
+          <span id="map-errors" class="error"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card hidden" id="step-results">
+      <h2><span class="step">3</span> Layer 1 accounts</h2>
+      <div class="tiles" id="stats"></div>
+      <ul class="warnings" id="warnings"></ul>
+      <details class="preview">
+        <summary>Per-Ack summary (total loss, put on hold)</summary>
+        <div class="scroll"><table class="data" id="ack-summary"></table></div>
+      </details>
+      <div class="toolbar">
+        <input type="search" id="f-text" placeholder="Filter: account, bank, IFSC, Ack no…" aria-label="Filter">
+        <label><input type="checkbox" id="f-repeated"> Repeated only</label>
+        <label>Min disputed ₹ <input type="number" id="f-min" min="0" step="1" class="w8"></label>
+        <select id="f-match" aria-label="Match filter">
+          <option value="">All banks</option>
+          <option value="matched">Matched to nodal sheet</option>
+          <option value="unmatched">Unmatched banks</option>
+        </select>
+        <span class="spacer"></span>
+        <button type="button" class="btn btn-small" id="sel-visible">Select shown</button>
+        <button type="button" class="btn btn-small" id="unsel-visible">Unselect shown</button>
+        <button type="button" class="btn btn-small" id="sel-default">Reset (all)</button>
+      </div>
+      <p class="small muted" id="sel-summary"></p>
+      <div class="scroll tall"><table class="data sortable" id="results"></table></div>
+    </section>
+
+    <section class="card hidden" id="step-identifiers">
+      <h2><span class="step">4</span> Phone numbers, URLs, social media / UPI / e-mail IDs</h2>
+      <p class="muted small">Taken from the mapped suspect columns of the export, plus any you add here. URLs, e-mail and UPI IDs are matched to a platform by the domains / handles in the nodal sheet. Mobile numbers need the operator (TSP) chosen — number series are unreliable because of portability.</p>
+      <div class="addbox">
+        <textarea id="id-add" rows="3" placeholder="Paste mobile numbers, URLs, social media IDs… one per line"></textarea>
+        <div class="formcol">
+          <select id="id-add-hint" aria-label="Type">
+            <option value="">Detect type</option>
+            <option value="phone">Mobile numbers</option>
+            <option value="url">URLs</option>
+            <option value="social">Social media IDs</option>
+          </select>
+          <input type="text" id="id-add-acks" placeholder="Ack no(s) (optional)">
+          <button type="button" class="btn btn-small" id="btn-id-add">Add</button>
+        </div>
+      </div>
+      <div class="toolbar">
+        <span>Assign all unassigned mobile numbers to</span>
+        <select id="bulk-tsp" aria-label="Operator for all unassigned mobile numbers"></select>
+        <button type="button" class="btn btn-small" id="btn-bulk-tsp">Apply</button>
+      </div>
+      <div class="scroll"><table class="data" id="identifiers"></table></div>
+    </section>
+
+    <section class="card hidden" id="step-banks">
+      <h2><span class="step">5</span> Recipients &amp; documents requested</h2>
+      <div id="unmatched-box"></div>
+      <div class="scroll"><table class="data" id="banks"></table></div>
+    </section>
+
+    <section class="card hidden" id="step-generate">
+      <h2><span class="step">6</span> Generate &amp; send</h2>
+      <div class="formrow">
+        <label>Notice date <input type="text" id="g-date" placeholder="DD-MM-YYYY"></label>
+        <label>Reply due in (days) <input type="number" id="g-days" min="1" max="60" value="7" class="w8"></label>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-send-all" class="btn btn-primary">Send all by e-mail</button>
+        <button type="button" id="btn-zip" class="btn">Download ZIP (notices + e-mail drafts + FIR copy + Excel)</button>
+        <button type="button" id="btn-xlsx" class="btn">Excel summary only</button>
+        <span id="gen-status" class="muted"></span>
+      </div>
+      <p class="small" id="mail-hint"></p>
+      <p class="small muted">Without the mail helper: e-mail drafts (.eml) open in Outlook as a ready-to-send message with the notice and FIR copy attached — check it and press Send. In Thunderbird use “Edit as New”. Then set the status to <em>Sent</em> below so reply tracking starts.</p>
+      <h3>Notices <button type="button" class="btn btn-small" id="btn-copy-tsv">Copy e-mail table</button> <button type="button" class="btn btn-small" id="btn-mark-all-sent">Mark all generated as sent</button></h3>
+      <div class="scroll"><table class="data" id="emails"></table></div>
+      <h3>Notice register (replies)</h3>
+      <div class="scroll"><table class="data" id="register"></table></div>
+      <div class="actions">
+        <label class="btn">Attach reply files to a notice…<input type="file" id="file-reply-manual" multiple class="hidden"></label>
+        <select id="reply-manual-target" aria-label="Notice for the reply files"></select>
+      </div>
+    </section>
+
+    <section class="card danger-zone">
+      <button type="button" class="btn btn-danger" id="btn-delete-case">Delete this case</button>
+      <span class="small muted">Removes the case, its FIR copy and saved replies from this browser.</span>
+    </section>
+  </div>
+</main>
+
+<footer class="foot muted small">
+  BNSS94 Notice Tool · runs entirely in your browser · no data leaves this computer · verify every notice before sending.
+</footer>
+
+<!-- Settings dialog -->
+<dialog id="dlg-settings">
+  <form method="dialog" class="dlg">
+    <h2>Officer settings</h2>
+    <p class="small muted">Saved in this browser only and used in every notice.</p>
+    <label>Name <input type="text" name="officerName" autocomplete="name"></label>
+    <label>Designation <input type="text" name="designation" placeholder="e.g. Inspector of Police"></label>
+    <label>Office / unit <input type="text" name="station" placeholder="e.g. Cyber Crime Police Station, …"></label>
+    <label>Phone <input type="tel" name="phone"></label>
+    <label>Official e-mail <input type="email" name="officerEmail"></label>
+    <div class="actions">
+      <button type="submit" value="save" class="btn btn-primary">Save</button>
+      <button type="submit" value="cancel" class="btn">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Mail helper dialog -->
+<dialog id="dlg-mail" class="wide">
+  <div class="dlg">
+    <h2>Mail — send notices and collect replies automatically</h2>
+    <p class="small muted">Uses the <strong>mail helper</strong>, a small program that runs on this computer (<code>mail-helper/Start-Mail-Helper.bat</code>, needs Node.js). It sends from your own mailbox and checks it for replies. Your password goes only to the helper on this computer and to your mail server.</p>
+    <div class="formrow">
+      <label>Helper port <input type="number" id="m-port" class="w8" min="1" max="65535"></label>
+      <label>Pairing code (shown in the helper window) <input type="text" id="m-code" placeholder="XXXX-XXXX-XXXX" autocomplete="off"></label>
+      <button type="button" class="btn" id="m-connect">Connect</button>
+    </div>
+    <p id="m-conn" class="small"></p>
+    <div id="m-account" class="hidden">
+      <h3>Your mailbox</h3>
+      <div class="formrow">
+        <label>Your name <input type="text" id="m-fromName"></label>
+        <label>Your official e-mail <input type="email" id="m-fromEmail"></label>
+      </div>
+      <div class="formrow">
+        <label>Login / user name <input type="text" id="m-user" autocomplete="username"></label>
+        <label>Password <input type="password" id="m-pass" autocomplete="current-password"></label>
+        <label class="inline"><input type="checkbox" id="m-remember"> Remember password on this computer</label>
+      </div>
+      <p class="small muted">Gmail and Microsoft 365 need an <em>app password</em> (and SMTP/IMAP enabled). For official mail ask your mail administrator for the SMTP and IMAP server names and whether IMAP/SMTP access is allowed.</p>
+      <div class="formrow">
+        <label>Server settings
+          <select id="m-preset"><option value="">Custom / from my mail administrator</option><option value="gmail">Gmail / Google Workspace</option><option value="m365">Microsoft 365 / Outlook.com</option></select>
+        </label>
+      </div>
+      <table class="maptable">
+        <tr><td>Sending (SMTP)</td><td><input type="text" id="m-smtp-host" placeholder="smtp.example.gov.in"></td><td><input type="number" id="m-smtp-port" class="w8" placeholder="465"></td>
+          <td><select id="m-smtp-sec"><option value="tls">SSL/TLS (465)</option><option value="starttls">STARTTLS (587)</option></select></td></tr>
+        <tr><td>Mailbox (IMAP)</td><td><input type="text" id="m-imap-host" placeholder="imap.example.gov.in"></td><td><input type="number" id="m-imap-port" class="w8" placeholder="993"></td>
+          <td><select id="m-imap-sec"><option value="tls">SSL/TLS (993)</option><option value="starttls">STARTTLS (143)</option></select></td></tr>
+      </table>
+      <div class="formrow">
+        <label>Check for replies every (minutes) <input type="number" id="m-poll" class="w8" min="1" max="120"></label>
+        <label class="inline"><input type="checkbox" id="m-sent"> Keep a copy of each notice in my Sent folder</label>
+      </div>
+      <label class="inline small"><input type="checkbox" id="m-selfsigned"> The mail server uses an internal / self-signed certificate (only if your mail administrator says so)</label>
+      <div class="actions">
+        <button type="button" class="btn btn-primary" id="m-test">Save &amp; test connection</button>
+        <button type="button" class="btn" id="m-save">Save</button>
+      </div>
+      <p id="m-test-result" class="small"></p>
+    </div>
+    <div class="actions"><span class="spacer"></span><button type="button" class="btn" id="m-close">Close</button></div>
+  </div>
+</dialog>
+
+<!-- Template dialog -->
+<dialog id="dlg-template" class="wide">
+  <div class="dlg">
+    <h2>Templates</h2>
+    <p class="small muted">One line = one paragraph. <code>[center]</code> or <code>[right]</code> at the start of a line aligns it; <code>**bold**</code>, <code>__underline__</code>. Put <code>{{accounts_table}}</code> and <code>{{requested_items}}</code> on their own lines. Click a placeholder to insert it.</p>
+    <div class="chips" id="tpl-chips"></div>
+    <label>Notice (.docx)<textarea id="tpl-text" spellcheck="false" rows="18"></textarea></label>
+    <label>E-mail subject <input type="text" id="tpl-subject"></label>
+    <label>E-mail body<textarea id="tpl-body" spellcheck="false" rows="8"></textarea></label>
+    <p class="small muted">Keep <code>{{notice_ref}}</code> in the subject — replies are matched to notices by it.</p>
+    <p id="tpl-warn" class="error small"></p>
+    <div class="actions">
+      <button type="button" id="tpl-save" class="btn btn-primary">Save templates</button>
+      <button type="button" id="tpl-preview" class="btn">Preview notice</button>
+      <button type="button" id="tpl-default" class="btn">Restore defaults</button>
+      <button type="button" id="tpl-export" class="btn">Export .txt</button>
+      <label class="btn">Import .txt<input type="file" id="tpl-import" accept=".txt,text/plain" class="hidden"></label>
+      <span class="spacer"></span>
+      <button type="button" id="tpl-close" class="btn">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Preview dialog -->
+<dialog id="dlg-preview" class="wide">
+  <div class="dlg">
+    <div class="paper" id="preview-body"></div>
+    <div class="actions"><button type="button" class="btn" id="preview-close">Close</button></div>
+  </div>
+</dialog>
+
+<!-- Prompt dialog (reply received / missing fields) -->
+<dialog id="dlg-prompt">
+  <div class="dlg">
+    <h2 id="prompt-title"></h2>
+    <div id="prompt-body"></div>
+    <div class="actions"><button type="button" class="btn btn-primary" id="prompt-close">OK</button></div>
+  </div>
+</dialog>
+
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+<script src="vendor/xlsx.full.min.js"></script>
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/docx.iife.js"></script>
+<script src="js/analysis.js"></script>
+<script src="js/template.js"></script>
+<script src="js/mail.js"></script>
+<script src="js/outputs.js"></script>
+<script src="js/store.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
