@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Privacy: no network access at all. connect-src 'none' blocks fetch/XHR/WebSocket/beacons. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<title>BNSS94 Notice Tool</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>BNSS94 Notice Tool</h1>
+    <span class="badge badge-ok" title="All processing happens in this browser. Nothing is uploaded.">Offline · data stays on this computer</span>
+  </div>
+  <nav>
+    <button type="button" id="btn-settings" class="btn">Officer settings</button>
+    <button type="button" id="btn-template" class="btn">Notice template</button>
+    <button type="button" id="btn-reset" class="btn btn-ghost" title="Clear loaded files and results from this page">Clear data</button>
+  </nav>
+</header>
+
+<main>
+  <div id="officer-warning" class="alert alert-warn hidden">
+    Officer details are not set. <button type="button" class="linklike" data-open="settings">Enter them once</button> — they fill the notice signature block.
+  </div>
+
+  <!-- Step 1 -->
+  <section class="card" id="step-upload">
+    <h2><span class="step">1</span> Upload files</h2>
+    <div class="grid2">
+      <label class="drop" id="drop-txn">
+        <input type="file" id="file-txn" accept=".xlsx,.xls,.csv" multiple>
+        <strong>NCRP transaction export</strong>
+        <span>Excel / CSV — one or more files. Drop here or click.</span>
+        <span class="filelist" id="txn-files"></span>
+      </label>
+      <label class="drop" id="drop-nodal">
+        <input type="file" id="file-nodal" accept=".xlsx,.xls,.csv">
+        <strong>Nodal officers sheet</strong>
+        <span>Bank name / IFSC prefix → e-mail IDs. Drop here or click.</span>
+        <span class="filelist" id="nodal-files"></span>
+      </label>
+    </div>
+    <p class="muted small">Try it with the synthetic files in the <code>samples/</code> folder. Files are read by this page only; they are never sent anywhere.</p>
+    <div id="upload-errors"></div>
+  </section>
+
+  <!-- Step 2 -->
+  <section class="card hidden" id="step-mapping">
+    <h2><span class="step">2</span> Map columns</h2>
+    <p class="muted">Columns were guessed from the headers. Check each one, then analyse. Your choices are remembered for next time.</p>
+    <div class="grid2">
+      <div>
+        <h3>Transaction export</h3>
+        <div id="txn-sheets"></div>
+        <table class="maptable" id="txn-map"></table>
+      </div>
+      <div>
+        <h3>Nodal officers sheet</h3>
+        <div id="nodal-sheets"></div>
+        <table class="maptable" id="nodal-map"></table>
+        <p class="muted small" id="nodal-missing">Upload the nodal officers sheet to map e-mails.</p>
+      </div>
+    </div>
+    <details class="preview">
+      <summary>Preview first rows of the transaction export</summary>
+      <div class="scroll"><table class="data" id="txn-preview"></table></div>
+    </details>
+    <div class="actions">
+      <button type="button" id="btn-analyse" class="btn btn-primary">Analyse Layer 1 accounts</button>
+      <span id="map-errors" class="error"></span>
+    </div>
+  </section>
+
+  <!-- Step 3 -->
+  <section class="card hidden" id="step-results">
+    <h2><span class="step">3</span> Layer 1 accounts</h2>
+    <div class="tiles" id="stats"></div>
+    <ul class="warnings" id="warnings"></ul>
+    <div class="toolbar">
+      <input type="search" id="f-text" placeholder="Filter: account, bank, IFSC, Ack no…" aria-label="Filter">
+      <label><input type="checkbox" id="f-repeated"> Repeated only</label>
+      <label>Min disputed ₹ <input type="number" id="f-min" min="0" step="1" class="w8"></label>
+      <select id="f-match" aria-label="Match filter">
+        <option value="">All banks</option>
+        <option value="matched">Matched to nodal sheet</option>
+        <option value="unmatched">Unmatched banks</option>
+      </select>
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-small" id="sel-visible">Select shown</button>
+      <button type="button" class="btn btn-small" id="unsel-visible">Unselect shown</button>
+      <button type="button" class="btn btn-small" id="sel-default">Reset (all)</button>
+    </div>
+    <p class="small muted" id="sel-summary"></p>
+    <div class="scroll tall"><table class="data sortable" id="results"></table></div>
+  </section>
+
+  <!-- Step 4 -->
+  <section class="card hidden" id="step-banks">
+    <h2><span class="step">4</span> Banks &amp; nodal officers</h2>
+    <div id="unmatched-box"></div>
+    <div class="scroll"><table class="data" id="banks"></table></div>
+  </section>
+
+  <!-- Step 5 -->
+  <section class="card hidden" id="step-generate">
+    <h2><span class="step">5</span> Generate notices</h2>
+    <div class="formrow">
+      <label>Case / notice reference <input type="text" id="g-caseref" placeholder="e.g. CCPS/123/2026"></label>
+      <label>Notice date <input type="text" id="g-date" placeholder="DD-MM-YYYY"></label>
+    </div>
+    <p class="small muted">The reference and date are used for this batch only and are not saved.</p>
+    <div class="actions">
+      <button type="button" id="btn-zip" class="btn btn-primary">Download ZIP (all notices + Excel + e-mail list)</button>
+      <button type="button" id="btn-xlsx" class="btn">Excel summary only</button>
+      <span id="gen-status" class="muted"></span>
+    </div>
+    <h3>E-mail list <button type="button" class="btn btn-small" id="btn-copy-tsv">Copy table</button></h3>
+    <p class="small muted">Copy pastes as a table into Excel, Word or Outlook. Attach each file to the e-mail for that bank.</p>
+    <div class="scroll"><table class="data" id="emails"></table></div>
+  </section>
+</main>
+
+<footer class="foot muted small">
+  BNSS94 Notice Tool · runs entirely in your browser · no data leaves this computer · verify every notice before sending.
+</footer>
+
+<!-- Settings dialog -->
+<dialog id="dlg-settings">
+  <form method="dialog" class="dlg">
+    <h2>Officer settings</h2>
+    <p class="small muted">Saved in this browser only (localStorage) and used in every notice.</p>
+    <label>Name <input type="text" name="officerName" autocomplete="name"></label>
+    <label>Designation <input type="text" name="designation" placeholder="e.g. Inspector of Police"></label>
+    <label>Police station / unit <input type="text" name="station" placeholder="e.g. Cyber Crime Police Station, …"></label>
+    <label>Phone <input type="tel" name="phone"></label>
+    <label>Official e-mail <input type="email" name="officerEmail"></label>
+    <div class="actions">
+      <button type="submit" value="save" class="btn btn-primary">Save</button>
+      <button type="submit" value="cancel" class="btn">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Template dialog -->
+<dialog id="dlg-template" class="wide">
+  <div class="dlg">
+    <h2>Notice template</h2>
+    <p class="small muted">One line = one paragraph. <code>[center]</code> or <code>[right]</code> at the start of a line aligns it; <code>**bold**</code>, <code>__underline__</code>. Put <code>{{accounts_table}}</code> on its own line for the account table. Click a placeholder to insert it.</p>
+    <div class="chips" id="tpl-chips"></div>
+    <textarea id="tpl-text" spellcheck="false" rows="22"></textarea>
+    <p id="tpl-warn" class="error small"></p>
+    <div class="actions">
+      <button type="button" id="tpl-save" class="btn btn-primary">Save template</button>
+      <button type="button" id="tpl-preview" class="btn">Preview</button>
+      <button type="button" id="tpl-default" class="btn">Restore default</button>
+      <button type="button" id="tpl-export" class="btn">Export .txt</button>
+      <label class="btn">Import .txt<input type="file" id="tpl-import" accept=".txt,text/plain" class="hidden"></label>
+      <span class="spacer"></span>
+      <button type="button" id="tpl-close" class="btn">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Preview dialog -->
+<dialog id="dlg-preview" class="wide">
+  <div class="dlg">
+    <div class="paper" id="preview-body"></div>
+    <div class="actions"><button type="button" class="btn" id="preview-close">Close</button></div>
+  </div>
+</dialog>
+
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+<script src="vendor/xlsx.full.min.js"></script>
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/docx.iife.js"></script>
+<script src="js/analysis.js"></script>
+<script src="js/template.js"></script>
+<script src="js/outputs.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

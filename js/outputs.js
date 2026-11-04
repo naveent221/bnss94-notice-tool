@@ -39,7 +39,7 @@
     }
 
     // Column widths in twips (A4 text width with 2 cm margins ≈ 9638 twips).
-    var COL_WIDTHS = [600, 2300, 1400, 2938, 1600, 800];
+    var COL_WIDTHS = [680, 2150, 1700, 2608, 1700, 800];
 
     function tableFor(block) {
       var R = docx.AlignmentType.RIGHT, C = docx.AlignmentType.CENTER;
